@@ -11325,6 +11325,58 @@ test("provider switch retains history, settings boundaries and context across re
   }
 });
 
+test("provider switch keeps plugin-transformed user agents visible and durable", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-provider-switch-plugin-"));
+  const registry = new AgentStorage(join(workdir, "agents"), logger);
+  class TargetClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      const session = await super.createSession(config);
+      Object.assign(session, { provider: this.provider });
+      session.describePersistence = () => ({ provider: this.provider, sessionId: session.id! });
+      return session;
+    }
+  }
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient(), other: new TargetClient("other") },
+    registry,
+    logger,
+    pluginLifecycle: {
+      emit: () => {},
+      before: async (name, request) => {
+        if (name === "agent.create" && "config" in request) {
+          return { ...request, config: { ...request.config, internal: true } };
+        }
+        return request;
+      },
+    },
+  });
+  let agentId: string | undefined;
+  try {
+    const original = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = original.id;
+    await manager.appendTimelineItem(agentId, {
+      type: "user_message",
+      text: "Keep this task visible.",
+    });
+    const switched = await manager.switchAgentProvider(agentId, "other", "target-model");
+    expect(switched.internal).not.toBe(true);
+    expect(manager.getAgent(agentId)?.provider).toBe("other");
+    await manager.flush();
+    const reloaded = new AgentStorage(join(workdir, "agents"), logger);
+    expect(await reloaded.get(agentId)).toMatchObject({
+      provider: "other",
+      persistence: { provider: "other", sessionId: switched.persistence?.sessionId },
+    });
+  } finally {
+    if (agentId) await manager.closeAgent(agentId);
+    await manager.flush();
+    await registry.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("provider switch preflight preserves the original when history or target is missing", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-provider-switch-preflight-"));
   const registry = new AgentStorage(join(workdir, "agents"), logger);

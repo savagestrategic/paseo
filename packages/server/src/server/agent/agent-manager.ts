@@ -1679,7 +1679,8 @@ export class AgentManager {
     let env: Record<string, string> | undefined;
     if (this.pluginLifecycle) {
       const request = await this.pluginLifecycle.before("agent.create", { config });
-      config = request.config;
+      // A user conversation must remain visible and persisted after plugin transforms.
+      config = { ...request.config, internal: false };
       env = request.env;
     }
     if (config.cwd !== original.cwd)
