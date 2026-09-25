@@ -605,6 +605,10 @@ export interface AgentSessionConfig {
    * Mapped by each provider to its native instruction field.
    */
   systemPrompt?: string;
+  /** Daemon-owned transcript supplied on subsequent prompts after a provider switch. */
+  continuationArchive?: string;
+  continuationArchiveSha256?: string;
+  continuationPending?: boolean;
   /**
    * Daemon-level instructions appended at runtime. This is deliberately not
    * persisted into agent config so daemon setting changes apply cleanly.

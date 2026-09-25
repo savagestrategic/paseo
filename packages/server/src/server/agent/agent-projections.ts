@@ -319,6 +319,11 @@ function buildSerializableConfig(config: AgentSessionConfig): SerializableAgentC
       preapproved: config.toolPolicy.preapproved.map((grant) => ({ ...grant })),
     };
   }
+  if (config.continuationArchiveSha256)
+    serializable.continuationArchiveSha256 = config.continuationArchiveSha256;
+  if (config.continuationPending !== undefined)
+    serializable.continuationPending = config.continuationPending;
+  if (config.continuationArchive) serializable.continuationArchive = config.continuationArchive;
   if (config.systemPrompt) {
     serializable.systemPrompt = config.systemPrompt;
   }

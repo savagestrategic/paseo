@@ -1545,6 +1545,10 @@ export const AgentControls = memo(function AgentControls({
     useShallow((state) => selectAgentControlsSlice(state, serverId, agentId)),
   );
   const client = useSessionStore((state) => state.sessions[serverId]?.client ?? null);
+  const supportsProviderSwitching = useSessionStore(
+    (state) => state.sessions[serverId]?.serverInfo?.features?.providerSwitching === true,
+  );
+  const [switchingProvider, setSwitchingProvider] = useState(false);
   const toast = useToast();
   const modeControl = useLiveAgentModeControl(serverId, agentId);
   const commandCenterModes = toCommandCenterModes(modeControl);
@@ -1576,6 +1580,7 @@ export const AgentControls = memo(function AgentControls({
     [agent?.provider, models],
   );
   const agentModelSelectorProviders = useMemo(() => {
+    if (supportsProviderSwitching) return buildSelectableProviderSelectorProviders(snapshotEntries);
     if (snapshotSelectedEntry) {
       return buildSelectableProviderSelectorProviders([snapshotSelectedEntry]);
     }
@@ -1583,7 +1588,13 @@ export const AgentControls = memo(function AgentControls({
       providerDefinitions: agentProviderDefinitions,
       modelsByProvider: agentProviderModels,
     });
-  }, [agentProviderDefinitions, agentProviderModels, snapshotSelectedEntry]);
+  }, [
+    agentProviderDefinitions,
+    agentProviderModels,
+    snapshotSelectedEntry,
+    supportsProviderSwitching,
+    snapshotEntries,
+  ]);
 
   const modelSelection = resolveAgentModelSelection({
     models,
@@ -1628,8 +1639,28 @@ export const AgentControls = memo(function AgentControls({
     [agentId, agentProvider, client, toast, updatePreferences],
   );
   const handleSelectCommandCenterModel = useCallback(
-    (_provider: AgentProvider, modelId: string) => handleSelectModel(modelId),
-    [handleSelectModel],
+    async (provider: AgentProvider, modelId: string) => {
+      if (provider === agentProvider) return handleSelectModel(modelId);
+      if (!client || switchingProvider || !supportsProviderSwitching) return;
+      setSwitchingProvider(true);
+      try {
+        await client.switchAgentProvider(agentId, provider, modelId);
+        toast.show("Provider changed. Send a message to continue with the retained conversation.");
+      } catch (error) {
+        toast.error(toErrorMessage(error));
+      } finally {
+        setSwitchingProvider(false);
+      }
+    },
+    [
+      handleSelectModel,
+      agentProvider,
+      agentId,
+      client,
+      switchingProvider,
+      supportsProviderSwitching,
+      toast,
+    ],
   );
 
   // A running agent is one provider's process, so only that provider's profiles
@@ -1779,6 +1810,7 @@ export const AgentControls = memo(function AgentControls({
       {profileEditor.element}
       <ControlledAgentControls
         provider={agent.provider}
+        onSelectProviderAndModel={handleSelectCommandCenterModel}
         modelSelectorProviders={agentModelSelectorProviders}
         modelOptions={modelOptions}
         selectedModelId={modelSelection.activeModelId ?? undefined}
@@ -1798,7 +1830,7 @@ export const AgentControls = memo(function AgentControls({
         onRetryModelProvider={handleRetryModelProvider}
         isRetryingModelProvider={snapshotIsRefreshing}
         onDropdownClose={onDropdownClose}
-        disabled={!client}
+        disabled={!client || switchingProvider}
         modeControl={modeControl}
         modelSelectorServerId={serverId}
         isCompactLayout={isCompactLayout}

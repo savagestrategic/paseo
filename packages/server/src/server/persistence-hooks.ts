@@ -74,6 +74,9 @@ export function buildConfigOverrides(record: StoredAgentRecord): Partial<AgentSe
     providerOptions: record.config?.providerOptions ?? undefined,
     toolPolicy: record.config?.toolPolicy ?? undefined,
     systemPrompt: record.config?.systemPrompt ?? undefined,
+    continuationArchive: record.config?.continuationArchive,
+    continuationArchiveSha256: record.config?.continuationArchiveSha256,
+    continuationPending: record.config?.continuationPending,
     mcpServers: record.config?.mcpServers ?? undefined,
   });
 }
@@ -96,6 +99,9 @@ export function buildSessionConfig(
     providerOptions: overrides.providerOptions,
     toolPolicy: overrides.toolPolicy,
     systemPrompt: overrides.systemPrompt,
+    continuationArchive: overrides.continuationArchive,
+    continuationArchiveSha256: overrides.continuationArchiveSha256,
+    continuationPending: overrides.continuationPending,
     mcpServers: overrides.mcpServers,
   });
 }

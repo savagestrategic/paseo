@@ -11113,3 +11113,247 @@ test("concurrent native restores run once before resuming the same agent", async
     rmSync(workdir, { recursive: true, force: true });
   }
 });
+
+test("provider switch retains history, settings boundaries and context across reload", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-provider-switch-"));
+  const registry = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient(), other: new TestAgentClient("other") },
+    registry,
+    logger,
+  });
+  try {
+    const original = await manager.createAgent(
+      { provider: "codex", cwd: workdir, modeId: "full-access", systemPrompt: "Stay scoped." },
+      undefined,
+      { labels: { keep: "yes" } },
+    );
+    await manager.appendTimelineItem(original.id, {
+      type: "user_message",
+      text: "Complete the unfinished migration.",
+    });
+    const switched = await manager.switchAgentProvider(original.id, "other", "target-model");
+    expect(switched.id).toBe(original.id);
+    expect(switched.provider).toBe("other");
+    expect(switched.cwd).toBe(workdir);
+    expect(switched.labels).toEqual(original.labels);
+    expect(switched.config.modeId).toBeUndefined();
+    expect(switched.config.systemPrompt).toBe("Stay scoped.");
+    expect(switched.persistence?.sessionId).not.toBe(original.persistence?.sessionId);
+    const { readFile, stat } = await import("node:fs/promises");
+    const archive = switched.config.continuationArchive!;
+    const retained = JSON.parse(await readFile(archive, "utf8"));
+    expect(retained.rows[0].item.text).toContain("unfinished migration");
+    expect(retained.record).toBeUndefined();
+    expect((await stat(archive)).mode & 0o777).toBe(0o600);
+    expect(
+      JSON.parse(await readFile(archive.replace(/\.json$/, ".record.json"), "utf8")).persistence
+        .sessionId,
+    ).toBe(original.persistence?.sessionId);
+    const start = vi.spyOn(switched.session!, "startTurn");
+    await manager.runAgent(original.id, [{ type: "text", text: "continue" }]);
+    expect(start.mock.calls[0]?.[0]).toEqual([
+      expect.objectContaining({ type: "text", text: expect.stringContaining(archive) }),
+      { type: "text", text: "continue" },
+    ]);
+    await manager.flush();
+    expect((await registry.get(original.id))?.config?.continuationPending).toBe(false);
+    await manager.runAgent(original.id, "next step");
+    expect(start.mock.calls[1]?.[0]).toBe("next step");
+    await expect(manager.rewind(original.id, "old-message", "conversation")).rejects.toThrow(
+      "Rewind is unavailable",
+    );
+    await manager.closeAgent(original.id);
+    const restored = await ensureAgentLoaded(original.id, {
+      agentManager: manager,
+      agentStorage: registry,
+      logger,
+    });
+    expect(restored.config.continuationArchive).toBe(archive);
+    expect(
+      manager
+        .getTimeline(original.id)
+        .some((item) => item.type === "user_message" && item.text.includes("unfinished migration")),
+    ).toBe(true);
+    await manager.closeAgent(original.id);
+    await registry.remove(original.id);
+    await expect(stat(archive)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(archive.replace(/\.json$/, ".record.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  } finally {
+    await manager.flush();
+    await registry.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("provider switch preflight preserves the original when history or target is missing", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-provider-switch-preflight-"));
+  const registry = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({ clients: { codex: new TestAgentClient() }, registry, logger });
+  try {
+    const original = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const close = vi.spyOn(original.session!, "close");
+    await expect(manager.switchAgentProvider(original.id, "missing", "model")).rejects.toThrow();
+    await expect(manager.switchAgentProvider(original.id, "codex", "model")).rejects.toThrow(
+      "No retained timeline",
+    );
+    expect(close).not.toHaveBeenCalled();
+    expect(manager.getAgent(original.id)?.session).toBe(original.session);
+    await manager.closeAgent(original.id);
+  } finally {
+    await manager.flush();
+    await registry.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("provider switch rejects active turns and blocks prompts during close", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-provider-switch-race-"));
+  const registry = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new HeldReloadCloseClient();
+  const target = new TestAgentClient("other");
+  const manager = new AgentManager({ clients: { codex: client, other: target }, registry, logger });
+  try {
+    const original = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(original.id, {
+      type: "user_message",
+      text: "Preserve this task.",
+    });
+    const pending = manager.streamAgent(original.id, "running");
+    await expect(manager.switchAgentProvider(original.id, "other", "model")).rejects.toThrow(
+      "Stop the current turn",
+    );
+    for await (const _ of pending) {
+      /* finish test turn */
+    }
+    const switching = manager.switchAgentProvider(original.id, "other", "model");
+    await client.waitForCloseToStart();
+    expect(() => manager.streamAgent(original.id, "race")).toThrow("Provider switch in progress");
+    expect(() => manager.tryRunOutOfBand(original.id, "/goal resume")).toThrow(
+      "Provider switch in progress",
+    );
+    expect(target.createdConfigs).toHaveLength(0);
+    client.finishClosing();
+    expect((await switching).provider).toBe("other");
+    await manager.closeAgent(original.id);
+  } finally {
+    client.finishClosing();
+    await manager.flush();
+    await registry.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("failed provider startup retains the native handle and transcript for retry", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-provider-switch-failure-"));
+  const registry = new AgentStorage(join(workdir, "agents"), logger);
+  const target = new TestAgentClient("other");
+  vi.spyOn(target, "createSession").mockRejectedValueOnce(new Error("target quota exhausted"));
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient(), other: target },
+    registry,
+    logger,
+  });
+  try {
+    const original = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(original.id, {
+      type: "user_message",
+      text: "Preserve edits.",
+    });
+    await expect(manager.switchAgentProvider(original.id, "other", "model")).rejects.toThrow(
+      "target quota exhausted",
+    );
+    const record = await registry.get(original.id);
+    expect(record?.provider).toBe("codex");
+    expect(record?.persistence?.sessionId).toBe(original.persistence?.sessionId);
+    expect(record?.lastStatus).toBe("closed");
+    expect(record?.config?.continuationArchive).toBeUndefined();
+    expect(record?.continuations).toHaveLength(1);
+    const retried = await manager.switchAgentProvider(original.id, "other", "model");
+    expect(retried.provider).toBe("other");
+    expect((await registry.get(original.id))?.continuations).toHaveLength(2);
+    await manager.closeAgent(original.id);
+  } finally {
+    await manager.flush();
+    await registry.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("provider switch restores both conversation segments after a cold manager restart", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-provider-switch-restart-"));
+  const registry = new AgentStorage(join(workdir, "agents"), logger);
+  class HistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      const session = await super.createSession(config);
+      Object.assign(session, { provider: this.provider });
+      session.describePersistence = () => ({ provider: this.provider, sessionId: session.id! });
+      return session;
+    }
+    override async resumeSession(
+      handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      const session = await super.resumeSession(handle, config);
+      Object.assign(session, { provider: this.provider });
+      session.describePersistence = () => ({
+        provider: this.provider,
+        sessionId: handle.sessionId,
+      });
+      session.streamHistory = async function* () {
+        yield {
+          type: "timeline",
+          provider: "other",
+          item: { type: "assistant_message", text: "Replacement progress." },
+        };
+      };
+      return session;
+    }
+  }
+  const clients = { codex: new TestAgentClient(), other: new HistoryClient("other") };
+  const manager = new AgentManager({ clients, registry, logger });
+  let restarted: AgentManager | undefined;
+  try {
+    const original = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(original.id, {
+      type: "user_message",
+      text: "Original objective.",
+    });
+    await manager.switchAgentProvider(original.id, "other", "model");
+    await manager.closeAgent(original.id);
+    await manager.flush();
+    await registry.flush();
+    const freshRegistry = new AgentStorage(join(workdir, "agents"), logger);
+    restarted = new AgentManager({ clients, registry: freshRegistry, logger });
+    await ensureAgentLoaded(original.id, {
+      agentManager: restarted,
+      agentStorage: freshRegistry,
+      logger,
+    });
+    const items = restarted.getTimeline(original.id);
+    expect(items).toEqual([
+      expect.objectContaining({ text: "Original objective." }),
+      expect.objectContaining({ text: "Replacement progress." }),
+    ]);
+    await restarted.reloadAgentSession(original.id, undefined, { rehydrateFromDisk: true });
+    await restarted.hydrateTimelineFromProvider(original.id);
+    expect(restarted.getTimeline(original.id)).toEqual(items);
+    await restarted.closeAgent(original.id);
+    await freshRegistry.flush();
+  } finally {
+    await manager.flush();
+    await restarted?.flush();
+    await registry.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});

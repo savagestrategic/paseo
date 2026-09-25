@@ -1,3 +1,8 @@
+import {
+  continuationPrefix,
+  readContinuationRows,
+  stripContinuationPrefix,
+} from "./provider-continuation.js";
 import { projectTimelineRows } from "./timeline-projection.js";
 import type { PluginLifecycle } from "../plugins/lifecycle/index.js";
 import { describeHookAgent, publishAgentStream } from "../plugins/lifecycle/index.js";
@@ -180,6 +185,9 @@ function buildStoredAgentConfig(record: StoredAgentRecord): AgentSessionConfig {
     config.providerOptions = record.config.providerOptions;
   }
   if (record.config.toolPolicy != null) config.toolPolicy = record.config.toolPolicy;
+  config.continuationArchive = record.config.continuationArchive;
+  config.continuationArchiveSha256 = record.config.continuationArchiveSha256;
+  config.continuationPending = record.config.continuationPending;
   if (record.config.systemPrompt != null) {
     config.systemPrompt = record.config.systemPrompt;
   }
@@ -699,6 +707,7 @@ export class AgentManager {
   private readonly agents = new Map<string, LiveManagedAgent>();
   private readonly timelineStore = new InMemoryAgentTimelineStore();
   private readonly providerSubagents = new ProviderSubagentStore();
+  private readonly switchingProviders = new Set<string>();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
   private readonly steerEventBarriers = new Map<string, SteerEventBarrier>();
@@ -1474,6 +1483,161 @@ export class AgentManager {
         this.reloadAgentSessionInternal(agentId, overrides, options),
       ),
     );
+  }
+
+  /** A new native runtime, retaining the durable Paseo conversation and checkout. */
+  switchAgentProvider(agentId: string, provider: string, model: string): Promise<ManagedAgent> {
+    return this.trackAgentRegistrationOperation(
+      this.runLifecycleMutation(agentId, async () => {
+        this.switchingProviders.add(agentId);
+        try {
+          this.assertAcceptingAgentRegistrations();
+          const registry = this.requireRegistry();
+          const original = await registry.get(agentId);
+          if (!original || original.internal || original.archivedAt) {
+            throw new Error("Select an existing, unarchived conversation to switch providers");
+          }
+          if (original.owner?.kind === "daemon") {
+            throw new Error("Managed executions must switch through their owning controller");
+          }
+          const existing = this.agents.get(agentId);
+          this.assertProviderSwitchQuiescent(agentId);
+          const { targetClient, prepared, env } = await this.prepareProviderSwitchTarget(
+            agentId,
+            original,
+            provider,
+            model,
+          );
+          const launchContext = await this.buildLaunchContext(
+            agentId,
+            targetClient,
+            original.cwd,
+            prepared.paseoToolPolicy,
+            env,
+            { reason: "create", purpose: "interactive", workspaceId: original.workspaceId ?? null },
+          );
+          // Prompts and settings are excluded while this lifecycle operation owns the agent.
+          // Prove retained history before closing the old writer.
+          await this.drainSessionEvents(agentId);
+          await this.flush();
+          const rows = this.durableTimelineStore
+            ? await this.durableTimelineStore.getCommittedRows(agentId)
+            : this.timelineStore.getRows(agentId);
+          if (!rows.length)
+            throw new Error(
+              "No retained timeline is available. Recover the original transcript before switching.",
+            );
+          if (this.hasInFlightRun(agentId))
+            throw new Error("Stop the current turn before switching providers");
+          const archive = await registry.saveContinuation(agentId, rows);
+          if (existing) {
+            await this.closeReloadedSession(existing.session, agentId);
+            await this.drainSessionEvents(agentId);
+            this.cancelRunningProviderSubagents(agentId);
+            const closed = this.prepareAgentForClosure(existing, "provider switched");
+            await this.persistSnapshot(closed);
+            this.emitClosedAgent(closed, { persist: false });
+          }
+          const storedConfig = {
+            ...prepared.storedConfig,
+            continuationArchive: archive.file,
+            continuationArchiveSha256: archive.sha256,
+            continuationPending: true,
+          };
+          const launchConfig = {
+            ...prepared.launchConfig,
+            continuationArchive: archive.file,
+            continuationArchiveSha256: archive.sha256,
+            continuationPending: true,
+          };
+          let session: AgentSession | undefined;
+          try {
+            this.paseoToolPolicies.set(agentId, prepared.paseoToolPolicy);
+            session = await targetClient.createSession(
+              this.resolveProviderLaunchConfig(launchConfig, launchContext),
+              launchContext,
+            );
+            await this.requireExternalMcpSupport(session, storedConfig);
+            return await this.registerSession(session, storedConfig, agentId, {
+              publishWhenReady: true,
+              labels: original.labels,
+              workspaceId: original.workspaceId,
+              owner: original.owner,
+              createdAt: new Date(original.createdAt),
+              lastUserMessageAt: original.lastUserMessageAt
+                ? new Date(original.lastUserMessageAt)
+                : null,
+              initialTitle: original.title,
+              historyPrimed: true,
+              restoring: true,
+            });
+          } catch (error) {
+            if (session) {
+              // If registration failed halfway through, retain ownership until close succeeds.
+              await this.closeReloadedSession(session, agentId);
+              const failed = this.agents.get(agentId);
+              if (failed) this.prepareAgentForClosure(failed, "provider switch failed");
+            }
+            const latest = await registry.get(agentId);
+            await registry.upsert({
+              ...original,
+              lastStatus: "closed",
+              continuations: latest?.continuations,
+            });
+            throw error;
+          }
+        } finally {
+          this.switchingProviders.delete(agentId);
+        }
+      }),
+    );
+  }
+
+  private assertProviderSwitchQuiescent(agentId: string): void {
+    const existing = this.agents.get(agentId);
+    if (
+      this.hasInFlightRun(agentId) ||
+      existing?.lifecycle === "initializing" ||
+      existing?.pendingPermissions.size ||
+      this.providerSubagents.list(agentId).some((child) => child.status === "running")
+    ) {
+      throw new Error("Stop the current turn and resolve permissions before switching providers");
+    }
+  }
+
+  private async prepareProviderSwitchTarget(
+    agentId: string,
+    original: StoredAgentRecord,
+    provider: string,
+    model: string,
+  ) {
+    this.requireEnabledProvider(provider);
+    const client = await this.requireAvailableClient({ provider });
+    // Resolve target settings independently. Provider-native modes, options, and
+    // permission shortcuts must never bleed into the replacement runtime.
+    let config: AgentSessionConfig = {
+      provider,
+      model,
+      cwd: original.cwd,
+      title: original.title ?? undefined,
+      systemPrompt: original.config?.systemPrompt ?? undefined,
+      mcpServers: original.config?.mcpServers ?? undefined,
+    };
+    let env: Record<string, string> | undefined;
+    if (this.pluginLifecycle) {
+      const request = await this.pluginLifecycle.before("agent.create", { config });
+      config = request.config;
+      env = request.env;
+    }
+    if (config.cwd !== original.cwd)
+      throw new Error("A provider switch must keep the original working directory");
+    this.requireEnabledProvider(config.provider);
+    const targetClient =
+      config.provider === provider
+        ? client
+        : await this.requireAvailableClient({ provider: config.provider });
+    const prepared = await this.prepareSessionConfig(config, agentId, env);
+    return { targetClient, prepared, env };
   }
 
   private async reloadAgentSessionInternal(
@@ -2405,7 +2569,20 @@ export class AgentManager {
   }): Promise<string> {
     const { agent, agentId, pendingRun, prompt, options } = params;
     try {
-      const result = await agent.session.startTurn(prompt, options);
+      const archive = agent.config.continuationArchive;
+      if (archive && agent.config.continuationPending) {
+        await readContinuationRows(archive, agent.config.continuationArchiveSha256, agent.id);
+      }
+      const context =
+        archive && agent.config.continuationPending ? continuationPrefix(archive) : "";
+      let continuedPrompt: AgentPromptInput = prompt;
+      if (context) {
+        continuedPrompt =
+          typeof prompt === "string"
+            ? context + prompt
+            : [{ type: "text", text: context }, ...prompt];
+      }
+      const result = await agent.session.startTurn(continuedPrompt, options);
       if (pendingRun.settled) {
         throw new Error(`Agent ${agentId} run was canceled before its turn started`);
       }
@@ -3102,11 +3279,28 @@ export class AgentManager {
     options?: HydrateTimelineOptions,
   ): Promise<void> {
     const agent = this.requireSessionAgent(agentId);
+    if (agent.config.continuationArchive && (!agent.historyPrimed || options?.force)) {
+      // A provider only knows its own segment. Rebuild it after the archived
+      // conversation, including on a cold daemon restart.
+      const broadcast = options?.broadcast ?? false;
+      const broadcastTimeline = options?.broadcastTimeline ?? broadcast;
+      await this.forceHydrateTimelineFromLegacyProviderHistory(
+        agent,
+        typeof broadcast === "function" ? broadcast() : broadcast,
+        typeof broadcastTimeline === "function" ? broadcastTimeline() : broadcastTimeline,
+      );
+      return;
+    }
     await this.hydrateTimelineFromLegacyProviderHistory(agent, options);
   }
 
   async rewind(agentId: string, messageId: string, mode: RewindMode): Promise<void> {
     const agent = this.requireSessionAgent(agentId);
+    if (agent.config.continuationArchive) {
+      throw new Error(
+        "Rewind is unavailable across provider changes. The original transcript is retained in the continuation archive.",
+      );
+    }
     const submittedRow = this.timelineStore
       .getRows(agentId)
       .find(
@@ -3595,7 +3789,14 @@ export class AgentManager {
       workspaceId: options?.workspaceId,
       owner: options?.owner,
       session,
-      capabilities: session.capabilities,
+      capabilities: config.continuationArchive
+        ? {
+            ...session.capabilities,
+            supportsRewindConversation: false,
+            supportsRewindFiles: false,
+            supportsRewindBoth: false,
+          }
+        : session.capabilities,
       config,
       runtimeInfo: undefined,
       lifecycle: "initializing",
@@ -3942,6 +4143,13 @@ export class AgentManager {
     broadcast: boolean,
     broadcastTimeline: boolean,
   ): Promise<void> {
+    const retainedRows = agent.config.continuationArchive
+      ? await readContinuationRows(
+          agent.config.continuationArchive,
+          agent.config.continuationArchiveSha256,
+          agent.id,
+        )
+      : [];
     const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
     const providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
     for await (const rawEvent of agent.session.streamHistory()) {
@@ -3950,7 +4158,10 @@ export class AgentManager {
         if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
           continue;
         }
-        historyEvents.push(event);
+        historyEvents.push({
+          ...event,
+          item: stripContinuationPrefix(event.item, agent.config.continuationArchive),
+        });
       } else if (event.type === "provider_subagent") {
         providerSubagentEvents.push(event);
       }
@@ -3959,7 +4170,11 @@ export class AgentManager {
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
     await this.deleteCommittedTimeline(agent.id);
     this.timelineStore.delete(agent.id);
-    this.timelineStore.initialize(agent.id, { timestamp: new Date().toISOString() });
+    this.timelineStore.initialize(agent.id, {
+      rows: retainedRows,
+      timestamp: new Date().toISOString(),
+    });
+    this.enqueueDurableTimelineBulkInsert(agent.id, retainedRows);
     agent.historyPrimed = true;
 
     for (const event of this.providerSubagents.deleteParent(agent.id)) {
@@ -4330,6 +4545,7 @@ export class AgentManager {
     flags: StreamEventFlags;
   }): Promise<void> {
     const { agent, event, options, flags } = params;
+    event.item = stripContinuationPrefix(event.item, agent.config.continuationArchive);
 
     if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
       flags.shouldDispatchEvent = false;
@@ -4387,6 +4603,10 @@ export class AgentManager {
       "agent.manager.turn.completed",
     );
     if (terminalDisposition === "stale") return;
+    if (isForegroundEvent && agent.config.continuationPending) {
+      agent.config.continuationPending = false;
+      this.emitState(agent);
+    }
     if (event.usage) {
       agent.lastUsage = { ...agent.lastUsage, ...event.usage };
     }
@@ -5258,6 +5478,10 @@ export class AgentManager {
   }
 
   private requireSessionAgent(id: string): ActiveManagedAgent {
+    if (this.switchingProviders.has(id))
+      throw new Error(
+        "Provider switch in progress. Wait for it to finish before sending messages or changing settings.",
+      );
     const agent = this.requireAgent(id);
     if (agent.session === null) {
       throw new Error(`Agent '${agent.id}' has no managed session`);

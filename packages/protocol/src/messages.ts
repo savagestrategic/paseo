@@ -1904,6 +1904,18 @@ export const SetAgentModeResponseMessageSchema = z.object({
   payload: AgentActionResponsePayloadSchema,
 });
 
+export const SwitchAgentProviderRequestMessageSchema = z.object({
+  type: z.literal("switch_agent_provider_request"),
+  agentId: z.string(),
+  provider: z.string().min(1),
+  model: z.string(),
+  requestId: z.string(),
+});
+export const SwitchAgentProviderResponseMessageSchema = z.object({
+  type: z.literal("switch_agent_provider_response"),
+  payload: AgentActionResponsePayloadSchema,
+});
+
 export const SetAgentModelRequestMessageSchema = z.object({
   type: z.literal("set_agent_model_request"),
   agentId: z.string(),
@@ -3248,6 +3260,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   AgentForkContextRequestMessageSchema,
   SetAgentModeRequestMessageSchema,
   SetAgentModelRequestMessageSchema,
+  SwitchAgentProviderRequestMessageSchema,
   SetAgentThinkingRequestMessageSchema,
   SetAgentFeatureRequestMessageSchema,
   AgentConfigApplyRequestMessageSchema,
@@ -3589,6 +3602,7 @@ export const ServerInfoStatusPayloadSchema = z
         pluginThemes: z.boolean().optional(),
         pluginSettings: z.boolean().optional(),
         pluginTimelineItems: z.boolean().optional(),
+        providerSwitching: z.boolean().optional(),
         // COMPAT(skillManagement): added in v0.4.0, remove gate after 2027-08-16.
         skillManagement: z.boolean().optional(),
         // COMPAT(terminalRestoreModes): added in v0.1.81, remove gate after 2026-11-23.
@@ -6836,6 +6850,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   WriteProjectConfigResponseMessageSchema,
   SetAgentModeResponseMessageSchema,
   SetAgentModelResponseMessageSchema,
+  SwitchAgentProviderResponseMessageSchema,
   SetAgentThinkingResponseMessageSchema,
   SetAgentFeatureResponseMessageSchema,
   AgentConfigApplyResponseMessageSchema,
