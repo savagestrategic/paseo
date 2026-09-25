@@ -149,6 +149,54 @@ describe("AgentStorage", () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
+  test("cold load keeps the current provider separate from private recovery records", async () => {
+    await storage.applySnapshot(
+      createManagedAgent({
+        provider: "claude",
+        persistence: { provider: "claude", sessionId: "original-native" },
+      }),
+    );
+    const archive = await storage.saveContinuation("agent-test", []);
+    const recoveryFile = archive.file.replace(/\.json$/, ".record.json");
+    const recovery = await fs.readFile(recoveryFile, "utf8");
+    await storage.applySnapshot(
+      createManagedAgent({
+        provider: "codex",
+        persistence: { provider: "codex", sessionId: "replacement-native" },
+      }),
+    );
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    const records = await reloaded.load();
+    expect(records).toHaveLength(1);
+    expect(await reloaded.get("agent-test")).toMatchObject({
+      provider: "codex",
+      persistence: { provider: "codex", sessionId: "replacement-native" },
+      continuations: [archive.file],
+    });
+    await reloaded.setTitle("agent-test", "Continued task");
+    expect(await fs.readFile(recoveryFile, "utf8")).toBe(recovery);
+    const restarted = new AgentStorage(storagePath, logger);
+    expect(await restarted.load()).toHaveLength(1);
+    expect(await restarted.get("agent-test")).toMatchObject({
+      provider: "codex",
+      title: "Continued task",
+    });
+  });
+
+  test("cold load does not resurrect an agent from an orphaned recovery record", async () => {
+    await storage.applySnapshot(createManagedAgent());
+    await storage.saveContinuation("agent-test", []);
+    for (const entry of await fs.readdir(storagePath, { withFileTypes: true })) {
+      if (entry.name !== ".continuations") {
+        await fs.rm(path.join(storagePath, entry.name), { recursive: true, force: true });
+      }
+    }
+    const reloaded = new AgentStorage(storagePath, logger);
+    expect(await reloaded.load()).toEqual([]);
+    expect(await reloaded.get("agent-test")).toBeNull();
+  });
+
   test("continuation cleanup removes partial transcript and private record on write failure", async () => {
     await storage.applySnapshot(createManagedAgent());
     const originalOpen = fs.open.bind(fs);

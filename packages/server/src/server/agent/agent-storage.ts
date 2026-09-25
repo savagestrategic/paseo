@@ -408,7 +408,8 @@ export class AgentStorage {
       .map((entry) => path.join(this.baseDir, entry.name));
 
     const projectDirs = entries
-      .filter((entry) => entry.isDirectory())
+      // Private recovery records are historical snapshots, never active agent records.
+      .filter((entry) => entry.isDirectory() && entry.name !== ".continuations")
       .map((entry) => path.join(this.baseDir, entry.name));
 
     const projectFileLists = await Promise.all(
