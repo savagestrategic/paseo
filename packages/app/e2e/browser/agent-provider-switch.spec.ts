@@ -47,6 +47,7 @@ test("switching provider keeps the existing agent and its visible history", asyn
     });
     await expect(oldPrompt).toBeVisible();
     await openModelPicker(page);
+    await page.getByRole("button", { name: "Back", exact: true }).click();
     await searchAllModels(page, "Gemini 3.5 Flash");
     await page.getByTestId("model-row-continuation-fixture-gemini-3.5-flash").click();
     await expectWorkspaceAgentConfiguration(workspace, {

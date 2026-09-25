@@ -28,6 +28,7 @@ async function openProviderSettingsFromModelSelector(page: Page) {
   const modelBrowser = page.getByTestId("agent-controls-model-browser-sheet");
   await expect(modelBrowser).toBeVisible({ timeout: 10_000 });
 
+  await modelBrowser.getByTestId("model-provider-mock").click();
   await page.getByRole("button", { name: /Open .* settings/ }).click();
   await expect(page.getByTestId("provider-settings-sheet")).toBeVisible({ timeout: 10_000 });
 }
