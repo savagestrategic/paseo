@@ -11520,6 +11520,21 @@ test("provider switch rejects active turns and blocks prompts during close", asy
     await expect(manager.setAgentFeature(original.id, "fast_mode", true)).rejects.toThrow(
       "Provider switch in progress",
     );
+    await expect(
+      manager.appendTimelineItem(original.id, { type: "assistant_message", text: "Plugin race" }),
+    ).rejects.toThrow("Provider switch in progress");
+    await expect(
+      manager.emitLiveTimelineItem(original.id, {
+        type: "assistant_message",
+        text: "Ephemeral race",
+      }),
+    ).rejects.toThrow("Provider switch in progress");
+    await expect(manager.hydrateTimelineFromProvider(original.id, { force: true })).rejects.toThrow(
+      "Provider switch in progress",
+    );
+    await expect(
+      manager.respondToPermission(original.id, "old", { behavior: "allow" }),
+    ).rejects.toThrow("Provider switch in progress");
     expect(setFeature).not.toHaveBeenCalled();
     expect(target.createdConfigs).toHaveLength(0);
     client.finishClosing();
@@ -11832,3 +11847,323 @@ test("provider switch restores both conversation segments after a cold manager r
     rmSync(workdir, { recursive: true, force: true });
   }
 });
+
+test.each(["append", "hydrate", "rewind"] as const)(
+  "an admitted %s behind a queued switch cannot mutate the replacement",
+  async (operation) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-switch-stale-mutation-"));
+    const registry = new AgentStorage(join(workdir, "agents"), logger);
+    const manager = new AgentManager({
+      clients: { codex: new TestAgentClient(), other: new TestAgentClient("other") },
+      registry,
+      logger,
+    });
+    try {
+      const original = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: undefined,
+      });
+      await manager.appendTimelineItem(original.id, { type: "user_message", text: "Keep task" });
+      const switching = manager.switchAgentProvider(original.id, "other", "target");
+      const actions = {
+        append: () =>
+          manager.appendTimelineItem(original.id, {
+            type: "assistant_message",
+            text: "Stale plugin",
+          }),
+        hydrate: () => manager.hydrateTimelineFromProvider(original.id, { force: true }),
+        rewind: () => manager.rewind(original.id, "old-message", "conversation"),
+      };
+      const rejected = expect(actions[operation]()).rejects.toThrow("Agent session changed");
+      await switching;
+      await rejected;
+      await manager.hydrateTimelineFromProvider(original.id, { force: true });
+      expect(manager.getTimeline(original.id)).toEqual([
+        expect.objectContaining({ text: "Keep task" }),
+      ]);
+      expect((await registry.get(original.id))?.provider).toBe("other");
+      await manager.closeAgent(original.id);
+    } finally {
+      await manager.flush();
+      await registry.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
+
+test("provider switch drains admitted history refresh before retaining its final rows", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-switch-held-history-"));
+  const registry = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient(), other: new TestAgentClient("other") },
+    registry,
+    logger,
+  });
+  const started = deferred<void>();
+  const release = deferred<void>();
+  let hydration: Promise<void> | undefined;
+  let switching: Promise<ManagedAgent> | undefined;
+  try {
+    const original = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(original.id, { type: "user_message", text: "Initial" });
+    original.session!.streamHistory = async function* () {
+      started.resolve();
+      await release.promise;
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "user_message", text: "Refreshed task" },
+      };
+    };
+    const close = vi.spyOn(original.session!, "close");
+    hydration = manager.hydrateTimelineFromProvider(original.id, { force: true });
+    await started.promise;
+    switching = manager.switchAgentProvider(original.id, "other", "target");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(close).not.toHaveBeenCalled();
+    release.resolve();
+    await hydration;
+    await switching;
+    await manager.hydrateTimelineFromProvider(original.id, { force: true });
+    expect(manager.getTimeline(original.id)).toEqual([
+      expect.objectContaining({ text: "Refreshed task" }),
+    ]);
+    await manager.closeAgent(original.id);
+  } finally {
+    release.resolve();
+    await Promise.allSettled([hydration, switching]);
+    await manager.flush();
+    await registry.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("provider switch waits for permission response refresh after pending permission is removed", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-switch-held-permission-"));
+  const registry = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient(), other: new TestAgentClient("other") },
+    registry,
+    logger,
+  });
+  const started = deferred<void>();
+  const release = deferred<void>();
+  let response: Promise<unknown> | undefined;
+  try {
+    const original = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(original.id, { type: "user_message", text: "Keep task" });
+    original.pendingPermissions.set("permission", {
+      id: "permission",
+      provider: "codex",
+      name: "Read",
+      kind: "tool",
+      input: {},
+    });
+    const getRuntimeInfo = original.session!.getRuntimeInfo.bind(original.session!);
+    original.session!.getRuntimeInfo = async () => {
+      started.resolve();
+      await release.promise;
+      return getRuntimeInfo();
+    };
+    const close = vi.spyOn(original.session!, "close");
+    response = manager.respondToPermission(original.id, "permission", { behavior: "allow" });
+    await started.promise;
+    expect(original.pendingPermissions.size).toBe(0);
+    await expect(manager.switchAgentProvider(original.id, "other", "target")).rejects.toThrow(
+      "resolve permissions",
+    );
+    expect(close).not.toHaveBeenCalled();
+    release.resolve();
+    await response;
+    await manager.switchAgentProvider(original.id, "other", "target");
+    expect((await registry.get(original.id))?.provider).toBe("other");
+    await manager.closeAgent(original.id);
+  } finally {
+    release.resolve();
+    await response;
+    await manager.flush();
+    await registry.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test.each([false, true])(
+  "provider switch retains closing events and rejects stale subscriptions (archive fails=%s)",
+  async (archiveFails) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-switch-close-history-"));
+    const registry = new AgentStorage(join(workdir, "agents"), logger);
+    const target = new TestAgentClient("other");
+    let oldCallback: ((event: AgentStreamEvent) => void) | undefined;
+    class ClosingClient extends TestAgentClient {
+      override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+        const session = new TestAgentSession(config);
+        const subscribe = session.subscribe.bind(session);
+        session.subscribe = (callback) => {
+          oldCallback = callback;
+          return subscribe(callback);
+        };
+        session.close = async () => {
+          session.pushEvent({
+            type: "timeline",
+            provider: "codex",
+            item: { type: "assistant_message", text: "Final closing note" },
+          });
+        };
+        return session;
+      }
+    }
+    const manager = new AgentManager({
+      clients: { codex: new ClosingClient(), other: target },
+      registry,
+      logger,
+    });
+    try {
+      const original = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: undefined,
+      });
+      await manager.appendTimelineItem(original.id, { type: "user_message", text: "Keep task" });
+      const save = registry.saveContinuation.bind(registry);
+      let saves = 0;
+      vi.spyOn(registry, "saveContinuation").mockImplementation(async (...args) => {
+        if (++saves === 2 && archiveFails) throw new Error("Final checkpoint failed");
+        return save(...args);
+      });
+      if (archiveFails) {
+        await expect(manager.switchAgentProvider(original.id, "other", "target")).rejects.toThrow(
+          "Final checkpoint failed",
+        );
+        expect(target.createdConfigs).toHaveLength(0);
+        expect((await registry.get(original.id))?.provider).toBe("codex");
+        expect((await registry.get(original.id))?.continuations).toHaveLength(1);
+      } else {
+        await manager.switchAgentProvider(original.id, "other", "target");
+        oldCallback!({
+          type: "timeline",
+          provider: "codex",
+          item: { type: "assistant_message", text: "Stale callback" },
+        });
+        await manager.flush();
+        await manager.hydrateTimelineFromProvider(original.id, { force: true });
+        expect(manager.getTimeline(original.id)).toEqual([
+          expect.objectContaining({ text: "Keep task" }),
+          expect.objectContaining({ text: "Final closing note" }),
+        ]);
+        expect((await registry.get(original.id))?.provider).toBe("other");
+        expect(saves).toBe(2);
+        await manager.closeAgent(original.id);
+      }
+    } finally {
+      await manager.flush();
+      await registry.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
+
+test("provider switch waits across rewind cancellation before its run lock", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-switch-rewind-cancel-"));
+  const registry = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient(), other: new TestAgentClient("other") },
+    registry,
+    logger,
+  });
+  const interrupted = deferred<void>();
+  const release = deferred<void>();
+  let rewinding: Promise<void> | undefined;
+  let switching: Promise<ManagedAgent> | undefined;
+  try {
+    const original = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(original.id, { type: "user_message", text: "Keep task" });
+    const session = original.session! as TestAgentSession;
+    Object.assign(session, {
+      capabilities: { ...session.capabilities, supportsRewindFiles: true },
+      revertFiles: vi.fn(async () => {}),
+    });
+    session.pushEvent({ type: "turn_started", provider: "codex", turnId: "autonomous" });
+    await manager.flush();
+    session.interrupt = async () => {
+      session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "autonomous" });
+      await manager.flush();
+      interrupted.resolve();
+      await release.promise;
+    };
+    const close = vi.spyOn(session, "close");
+    rewinding = manager.rewind(original.id, "message", "files");
+    await interrupted.promise;
+    expect(manager.getAgent(original.id)?.lifecycle).toBe("idle");
+    switching = manager.switchAgentProvider(original.id, "other", "target");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(close).not.toHaveBeenCalled();
+    release.resolve();
+    await rewinding;
+    await switching;
+    expect((await registry.get(original.id))?.provider).toBe("other");
+    await manager.closeAgent(original.id);
+  } finally {
+    release.resolve();
+    await Promise.allSettled([rewinding, switching]);
+    await manager.flush();
+    await registry.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test.each(["clear", "unread"] as const)(
+  "provider switch drains an admitted attention %s before replacing its snapshot",
+  async (operation) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-switch-attention-"));
+    const registry = new AgentStorage(join(workdir, "agents"), logger);
+    const manager = new AgentManager({
+      clients: { codex: new TestAgentClient(), other: new TestAgentClient("other") },
+      registry,
+      logger,
+    });
+    const started = deferred<void>();
+    const release = deferred<void>();
+    let attention: Promise<void> | undefined;
+    let switching: Promise<ManagedAgent> | undefined;
+    try {
+      const original = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: undefined,
+      });
+      await manager.appendTimelineItem(original.id, { type: "user_message", text: "Keep task" });
+      await manager.flush();
+      if (operation === "clear") await manager.markAgentUnread(original.id);
+      const apply = registry.applySnapshot.bind(registry);
+      vi.spyOn(registry, "applySnapshot").mockImplementationOnce(async (...args) => {
+        started.resolve();
+        await release.promise;
+        return apply(...args);
+      });
+      const close = vi.spyOn(original.session!, "close");
+      attention =
+        operation === "clear"
+          ? manager.clearAgentAttention(original.id)
+          : manager.markAgentUnread(original.id);
+      await started.promise;
+      switching = manager.switchAgentProvider(original.id, "other", "target");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(close).not.toHaveBeenCalled();
+      release.resolve();
+      await attention;
+      await switching;
+      manager.notifyAgentState(original.id);
+      await manager.clearAgentAttention(original.id);
+      await manager.flush();
+      expect((await registry.get(original.id))?.provider).toBe("other");
+      await manager.closeAgent(original.id);
+    } finally {
+      release.resolve();
+      await Promise.allSettled([attention, switching]);
+      await manager.flush();
+      await registry.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);

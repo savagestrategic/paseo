@@ -211,6 +211,7 @@ function detachWebOverlayListeners(): void {
 function addWebOverlay(entry: WebOverlayEntry): (options?: RemoveWebOverlayOptions) => void {
   webOverlayEntries.push(entry);
   attachWebOverlayListeners();
+  const registeredScope = entry.getScope();
 
   const focusFrame = window.requestAnimationFrame(() => {
     const scope = entry.getScope();
@@ -235,6 +236,16 @@ function addWebOverlay(entry: WebOverlayEntry): (options?: RemoveWebOverlayOptio
       // commit, otherwise React can put focus back into the closing overlay.
       queueMicrotask(() => {
         const currentScope = getTopWebOverlay()?.getScope();
+        const activeElement = restoreDocument.activeElement;
+        // Menu actions may focus a new pane or inline editor during commit.
+        // Only restore when focus stayed in the closing scope or fell to body.
+        if (
+          activeElement &&
+          activeElement !== restoreDocument.body &&
+          activeElement !== restoreTarget &&
+          !registeredScope?.contains(activeElement)
+        )
+          return;
         if (
           restoreDocument.contains(restoreTarget) &&
           (!currentScope || currentScope.contains(restoreTarget))

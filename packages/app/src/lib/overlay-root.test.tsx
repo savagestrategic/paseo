@@ -115,6 +115,23 @@ describe("useWebOverlayRegistration", () => {
     await act(async () => {});
   });
 
+  it("preserves focus assigned to a new pane or inline editor while closing", async () => {
+    const { result, rerender, unmount } = renderHook(
+      ({ active }: { active: boolean }) =>
+        useWebOverlayRegistration({ active, layer: 20, onKeyDown: () => false }),
+      { initialProps: { active: true } },
+    );
+    act(() => result.current(scope));
+    input.focus();
+    act(() => rerender({ active: false }));
+    const editor = document.createElement("input");
+    document.body.append(editor);
+    editor.focus();
+    await act(async () => {});
+    expect(document.activeElement).toBe(editor);
+    unmount();
+  });
+
   it("leaves IME composition keys with the focused editor", () => {
     const event = new KeyboardEvent("keydown", { key: "Process", bubbles: true });
     expect(dispatchTopWebOverlayKeyDown(event)).toBe(false);
