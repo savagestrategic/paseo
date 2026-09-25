@@ -11145,7 +11145,10 @@ test("provider switch retains history, settings boundaries and context across re
     const retained = JSON.parse(await readFile(archive, "utf8"));
     expect(retained.rows[0].item.text).toContain("unfinished migration");
     expect(retained.record).toBeUndefined();
-    expect((await stat(archive)).mode & 0o777).toBe(0o600);
+    // Windows exposes synthesized mode bits; access there follows directory ACLs.
+    if (process.platform !== "win32") {
+      expect((await stat(archive)).mode & 0o777).toBe(0o600);
+    }
     expect(
       JSON.parse(await readFile(archive.replace(/\.json$/, ".record.json"), "utf8")).persistence
         .sessionId,
@@ -11153,7 +11156,10 @@ test("provider switch retains history, settings boundaries and context across re
     const start = vi.spyOn(switched.session!, "startTurn");
     await manager.runAgent(original.id, [{ type: "text", text: "continue" }]);
     expect(start.mock.calls[0]?.[0]).toEqual([
-      expect.objectContaining({ type: "text", text: expect.stringContaining(archive) }),
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining(JSON.stringify(archive)),
+      }),
       { type: "text", text: "continue" },
     ]);
     await manager.flush();
