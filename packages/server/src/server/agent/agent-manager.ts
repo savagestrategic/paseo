@@ -735,6 +735,7 @@ export class AgentManager {
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly switchingProviders = new Set<string>();
   private readonly outOfBandRuns = new Map<string, number>();
+  private readonly pendingRewinds = new Map<string, number>();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
   private readonly steerEventBarriers = new Map<string, SteerEventBarrier>();
@@ -2658,6 +2659,9 @@ export class AgentManager {
    */
   tryRunOutOfBand(agentId: string, prompt: AgentPromptInput, options?: AgentRunOptions): boolean {
     const agent = this.requireSessionAgent(agentId);
+    if (this.pendingRewinds.has(agentId)) {
+      throw new Error(`Agent ${agentId} already has an active run`);
+    }
     const handler = agent.session.tryHandleOutOfBand?.(prompt);
     if (!handler) {
       return false;
@@ -2815,7 +2819,11 @@ export class AgentManager {
       },
       "agent.manager.stream.request",
     );
-    if (existingAgent.activeForegroundTurnId || this.runs.hasRun(agentId)) {
+    if (
+      existingAgent.activeForegroundTurnId ||
+      this.runs.hasRun(agentId) ||
+      this.pendingRewinds.has(agentId)
+    ) {
       this.logger.trace(
         {
           agentId,
@@ -3491,7 +3499,17 @@ export class AgentManager {
   }
 
   async rewind(agentId: string, messageId: string, mode: RewindMode): Promise<void> {
-    return this.runSessionMutation(agentId, () => this.rewindUnlocked(agentId, messageId, mode));
+    // Block new prompts synchronously, including while waiting for the lifecycle
+    // lane or cancellation of an existing run. Keep this separate from run state
+    // so rewind can still cancel the actual foreground turn after admission.
+    this.pendingRewinds.set(agentId, (this.pendingRewinds.get(agentId) ?? 0) + 1);
+    try {
+      await this.runSessionMutation(agentId, () => this.rewindUnlocked(agentId, messageId, mode));
+    } finally {
+      const remaining = (this.pendingRewinds.get(agentId) ?? 1) - 1;
+      if (remaining > 0) this.pendingRewinds.set(agentId, remaining);
+      else this.pendingRewinds.delete(agentId);
+    }
   }
 
   private async rewindUnlocked(
@@ -4278,16 +4296,23 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     options?: { emit?: boolean },
   ): Promise<void> {
+    const session = agent.session;
+    const isCurrent = () => this.agents.get(agent.id) === agent && agent.session === session;
     try {
-      const modes = await agent.session.getAvailableModes();
+      const modes = await session.getAvailableModes();
+      if (!isCurrent()) return;
       agent.availableModes = modes;
     } catch {
+      if (!isCurrent()) return;
       agent.availableModes = [];
     }
 
     try {
-      agent.currentModeId = await agent.session.getCurrentMode();
+      const mode = await session.getCurrentMode();
+      if (!isCurrent()) return;
+      agent.currentModeId = mode;
     } catch {
+      if (!isCurrent()) return;
       agent.currentModeId = null;
     }
 
@@ -4306,8 +4331,12 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     options?: { emit?: boolean },
   ): Promise<void> {
+    const session = agent.session;
     try {
-      const newInfo = await agent.session.getRuntimeInfo();
+      const newInfo = await session.getRuntimeInfo();
+      // Terminal event refreshes are detached from the event queue and may
+      // resolve after close/replacement. Never publish or persist that writer.
+      if (this.agents.get(agent.id) !== agent || agent.session !== session) return;
       const changed =
         newInfo.model !== agent.runtimeInfo?.model ||
         newInfo.thinkingOptionId !== agent.runtimeInfo?.thinkingOptionId ||

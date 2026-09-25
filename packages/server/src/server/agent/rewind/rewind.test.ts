@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { AgentManager } from "../agent-manager.js";
@@ -172,8 +172,21 @@ describe("AgentManager rewind", () => {
     expect(() => manager.streamAgent(agentId, "too early")).toThrow(
       "Agent 00000000-0000-4000-8000-000000000901 already has an active run",
     );
+    expect(() => manager.tryRunOutOfBand(agentId, "/compact")).toThrow("already has an active run");
 
     historyGate.release();
     await rewind;
+    expect(() => manager.streamAgent(agentId, "after rewind")).not.toThrow();
+  });
+
+  test("releases synchronous prompt admission after a failed rewind", async () => {
+    const { manager, session, agentId } = await createRewindHarness();
+    vi.spyOn(session, "revertFiles").mockRejectedValueOnce(new Error("rewind failed"));
+
+    const rewind = manager.rewind(agentId, "message-1", "files");
+    expect(() => manager.streamAgent(agentId, "too early")).toThrow("already has an active run");
+    await expect(rewind).rejects.toThrow("rewind failed");
+    expect(() => manager.tryRunOutOfBand(agentId, "/compact")).not.toThrow();
+    expect(() => manager.streamAgent(agentId, "after failure")).not.toThrow();
   });
 });

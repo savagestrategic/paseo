@@ -12167,3 +12167,62 @@ test.each(["clear", "unread"] as const)(
     }
   },
 );
+
+test("provider switch ignores a detached runtime refresh from the retired session", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-switch-old-refresh-"));
+  const registry = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient(), other: new TestAgentClient("other") },
+    registry,
+    logger,
+  });
+  const started = deferred<void>();
+  const release = deferred<void>();
+  const finished = deferred<void>();
+  try {
+    const original = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(original.id, { type: "user_message", text: "Keep task" });
+    const session = original.session! as TestAgentSession;
+    session.pushEvent({ type: "turn_started", provider: "codex", turnId: "old-turn" });
+    await manager.flush();
+    const runtime = await session.getRuntimeInfo();
+    session.getRuntimeInfo = async () => {
+      started.resolve();
+      await release.promise;
+      finished.resolve();
+      return { ...runtime, model: "late-old-model" };
+    };
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "old-turn" });
+    await started.promise;
+    await manager.flush();
+    expect(manager.getAgent(original.id)?.lifecycle).toBe("idle");
+    await manager.switchAgentProvider(original.id, "other", "target");
+    const targetPersistence = (await registry.get(original.id))?.persistence;
+    const publishedProviders: string[] = [];
+    const unsubscribe = manager.subscribe(
+      (event) => {
+        if (event.type === "agent_state") publishedProviders.push(event.agent.provider);
+      },
+      { replayState: false },
+    );
+    release.resolve();
+    await finished.promise;
+    await manager.flush();
+    await registry.flush();
+    expect(manager.getAgent(original.id)?.provider).toBe("other");
+    expect(await registry.get(original.id)).toMatchObject({
+      provider: "other",
+      persistence: targetPersistence,
+    });
+    expect(publishedProviders).not.toContain("codex");
+    unsubscribe();
+    await manager.closeAgent(original.id);
+  } finally {
+    release.resolve();
+    await manager.flush();
+    await registry.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
