@@ -692,6 +692,137 @@ test("uses an injected timeline store without making it a production requirement
   }
 });
 
+test("refreshing an agent replaces the injected timeline store instead of appending a second copy", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-timeline-rehydrate-"));
+  const store = new RecordingTimelineStore();
+  class HistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "user_message", text: "continue" },
+      };
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "done" },
+      };
+    }
+  }
+  class HistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new HistorySession(config);
+    }
+
+    override async resumeSession(
+      _handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      return new HistorySession({ provider: "codex", cwd: config?.cwd ?? workdir });
+    }
+  }
+  const manager = new AgentManager({
+    clients: { codex: new HistoryClient() },
+    durableTimelineStore: store,
+    logger,
+  });
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+
+    // What session.handleRefreshAgentRequest does for a loaded agent, twice over.
+    for (let refresh = 0; refresh < 2; refresh += 1) {
+      await manager.reloadAgentSession(agent.id, undefined, { rehydrateFromDisk: true });
+      await manager.hydrateTimelineFromProvider(agent.id, { broadcast: true });
+      await manager.flush();
+    }
+
+    const rows = await manager.getTimelineRows(agent.id);
+    expect(rows.map((row) => row.item)).toEqual([
+      { type: "user_message", text: "continue" },
+      { type: "assistant_message", text: "done" },
+    ]);
+  } finally {
+    if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a failed history replay leaves the committed timeline intact", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-timeline-replay-fail-"));
+  const store = new RecordingTimelineStore();
+  let failReplay = false;
+  class FlakyHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "user_message", text: "continue" },
+      };
+      if (failReplay) {
+        throw new Error("history stream closed");
+      }
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "done" },
+      };
+    }
+  }
+  class FlakyHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new FlakyHistorySession(config);
+    }
+
+    override async resumeSession(
+      _handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      return new FlakyHistorySession({ provider: "codex", cwd: config?.cwd ?? workdir });
+    }
+  }
+  const manager = new AgentManager({
+    clients: { codex: new FlakyHistoryClient() },
+    durableTimelineStore: store,
+    logger,
+  });
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    await manager.reloadAgentSession(agent.id, undefined, { rehydrateFromDisk: true });
+    await manager.hydrateTimelineFromProvider(agent.id, { broadcast: true });
+    await manager.flush();
+    const committed = await manager.getTimelineRows(agent.id);
+
+    failReplay = true;
+    await manager.reloadAgentSession(agent.id, undefined, { rehydrateFromDisk: true });
+    await expect(
+      manager.hydrateTimelineFromProvider(agent.id, { broadcast: true }),
+    ).rejects.toThrow("history stream closed");
+    await manager.flush();
+
+    expect(await manager.getTimelineRows(agent.id)).toEqual(committed);
+
+    // A retry once the provider recovers replaces that history rather than stacking on it.
+    failReplay = false;
+    await manager.hydrateTimelineFromProvider(agent.id, { broadcast: true });
+    await manager.flush();
+    expect((await manager.getTimelineRows(agent.id)).map((row) => row.item)).toEqual([
+      { type: "user_message", text: "continue" },
+      { type: "assistant_message", text: "done" },
+    ]);
+  } finally {
+    if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("retries provider history hydration after a stream failure", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-retry-"));
   let attempts = 0;
@@ -11216,6 +11347,56 @@ test("provider switch preflight preserves the original when history or target is
     rmSync(workdir, { recursive: true, force: true });
   }
 });
+
+test.each([false, true])(
+  "provider switch preserves the old writer when a timeline insert fails (later row: %s)",
+  async (appendLaterRow) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-provider-switch-persist-"));
+    const registry = new AgentStorage(join(workdir, "agents"), logger);
+    const store = new RecordingTimelineStore();
+    const target = new TestAgentClient("other");
+    const createTarget = vi.spyOn(target, "createSession");
+    const manager = new AgentManager({
+      clients: { codex: new TestAgentClient(), other: target },
+      registry,
+      durableTimelineStore: store,
+      logger,
+    });
+    let agentId: string | undefined;
+    try {
+      const original = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: undefined,
+      });
+      agentId = original.id;
+      await manager.appendTimelineItem(agentId, { type: "user_message", text: "Original task" });
+      await manager.flush();
+      vi.spyOn(store, "bulkInsert").mockRejectedValueOnce(new Error("disk full"));
+      await manager.appendTimelineItem(agentId, {
+        type: "user_message",
+        text: "Latest constraint",
+      });
+      await manager.flush();
+      if (appendLaterRow) {
+        await manager.appendTimelineItem(agentId, { type: "user_message", text: "Continue" });
+        await manager.flush();
+      }
+      const close = vi.spyOn(original.session!, "close");
+      await expect(manager.switchAgentProvider(agentId, "other", "model")).rejects.toThrow(
+        "Retained timeline is not fully persisted",
+      );
+      expect(close).not.toHaveBeenCalled();
+      expect(createTarget).not.toHaveBeenCalled();
+      expect(manager.getAgent(agentId)?.session).toBe(original.session);
+      expect((await registry.get(agentId))?.persistence).toEqual(original.persistence);
+      expect((await registry.get(agentId))?.continuations).toBeUndefined();
+    } finally {
+      if (agentId) await manager.closeAgent(agentId);
+      await manager.flush();
+      await registry.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
 
 test("provider switch rejects active turns and blocks prompts during close", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-provider-switch-race-"));
