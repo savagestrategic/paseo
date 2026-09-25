@@ -294,12 +294,19 @@ export class AgentStorage {
     if (!record) throw new Error(`Agent ${agentId} not found`);
     const file = path.join(this.baseDir, ".continuations", `${randomUUID()}.json`);
     await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-    // Separate the recovery record (which may contain MCP credentials) from the
-    // transcript read by the replacement model. UUID filenames are write-once.
-    await fs.writeFile(file.replace(/\.json$/, ".record.json"), JSON.stringify(record), {
-      mode: 0o600,
-      flag: "wx",
-    });
+    // Keep sensitive recovery state separate from the model-readable transcript.
+    // Track ownership after exclusive creation so partial writes can be removed
+    // without deleting a pre-existing file if exclusive creation ever collides.
+    const created: string[] = [];
+    const writePrivate = async (target: string, contents: string) => {
+      const handle = await fs.open(target, "wx", 0o600);
+      created.push(target);
+      try {
+        await handle.writeFile(contents);
+      } finally {
+        await handle.close();
+      }
+    };
     const contents = JSON.stringify({
       version: 1,
       agentId,
@@ -308,12 +315,30 @@ export class AgentStorage {
       title: record.title,
       rows,
     });
-    await fs.writeFile(file, contents, { mode: 0o600, flag: "wx" });
-    await this.queueRecordMutation(agentId, (current) => {
-      if (!current) throw new Error(`Agent ${agentId} not found`);
-      return { ...current, continuations: [...(current.continuations ?? []), file] };
-    });
-    return { file, sha256: continuationDigest(contents) };
+    try {
+      await writePrivate(file.replace(/\.json$/, ".record.json"), JSON.stringify(record));
+      await writePrivate(file, contents);
+      let tracked = false;
+      await this.queueRecordMutation(agentId, (current) => {
+        if (!current) throw new Error(`Agent ${agentId} not found`);
+        tracked = true;
+        return { ...current, continuations: [...(current.continuations ?? []), file] };
+      });
+      if (!tracked) throw new Error("Agent deletion interrupted the provider switch");
+      return { file, sha256: continuationDigest(contents) };
+    } catch (error) {
+      const cleanup = await Promise.allSettled(
+        created.map((target) => fs.rm(target, { force: true })),
+      );
+      cleanup.forEach((result, i) => {
+        if (result.status === "rejected")
+          this.logger.error(
+            { err: result.reason, file: created[i] },
+            "Continuation cleanup failed",
+          );
+      });
+      throw error;
+    }
   }
 
   async setTitle(agentId: string, title: string): Promise<void> {

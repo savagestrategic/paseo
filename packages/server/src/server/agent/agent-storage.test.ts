@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach, afterEach } from "vitest";
+import { describe, expect, test, beforeEach, afterEach, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
@@ -145,7 +145,50 @@ describe("AgentStorage", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test("continuation cleanup removes partial transcript and private record on write failure", async () => {
+    await storage.applySnapshot(createManagedAgent());
+    const originalOpen = fs.open.bind(fs);
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      const file = String(args[0]);
+      if (file.includes(".continuations") && !file.endsWith(".record.json")) {
+        vi.spyOn(handle, "writeFile").mockRejectedValue(new Error("disk full"));
+      }
+      return handle;
+    });
+    await expect(storage.saveContinuation("agent-test", [])).rejects.toThrow("disk full");
+    expect(await fs.readdir(path.join(storagePath, ".continuations"))).toEqual([]);
+    expect((await storage.get("agent-test"))?.continuations).toBeUndefined();
+  });
+
+  test("continuation cleanup removes both private files when tracking cannot be persisted", async () => {
+    await storage.applySnapshot(createManagedAgent());
+    vi.spyOn(fs, "rename").mockRejectedValue(new Error("registry write failed"));
+    await expect(storage.saveContinuation("agent-test", [])).rejects.toThrow(
+      "registry write failed",
+    );
+    expect(await fs.readdir(path.join(storagePath, ".continuations"))).toEqual([]);
+    expect((await storage.get("agent-test"))?.continuations).toBeUndefined();
+  });
+
+  test("continuation rejects and removes files when deletion fences its tracking mutation", async () => {
+    await storage.applySnapshot(createManagedAgent());
+    const originalOpen = fs.open.bind(fs);
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      if (String(args[0]).includes(".continuations")) storage.beginDelete("agent-test");
+      return handle;
+    });
+    await expect(storage.saveContinuation("agent-test", [])).rejects.toThrow(
+      "deletion interrupted",
+    );
+    expect(await fs.readdir(path.join(storagePath, ".continuations"))).toEqual([]);
+    await storage.remove("agent-test");
+    expect(await storage.get("agent-test")).toBeNull();
   });
 
   test("applySnapshot persists configs and snapshot metadata", async () => {
