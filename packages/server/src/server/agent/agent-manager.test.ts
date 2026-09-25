@@ -11400,6 +11400,44 @@ test("provider switch preflight preserves the original when history or target is
   }
 });
 
+test("an empty settings bundle remains a no-op for unloaded agents", async () => {
+  const manager = new AgentManager({ clients: { codex: new TestAgentClient() }, logger });
+  await expect(manager.updateAgentSettings("unloaded", {})).resolves.toBeUndefined();
+  await expect(manager.updateAgentSettings("unloaded", { features: {} })).resolves.toBeUndefined();
+});
+
+test("settings admitted behind a queued provider switch cannot affect its replacement", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-provider-switch-setting-queue-"));
+  const registry = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient(), other: new TestAgentClient("other") },
+    registry,
+    logger,
+  });
+  try {
+    const original = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(original.id, {
+      type: "user_message",
+      text: "Preserve this task.",
+    });
+    const switching = manager.switchAgentProvider(original.id, "other", "target");
+    const setting = expect(manager.setAgentModel(original.id, "obsolete-model")).rejects.toThrow(
+      "Agent session changed",
+    );
+    await switching;
+    await setting;
+    await manager.flush();
+    expect((await registry.get(original.id))?.config?.model).toBe("target");
+    await manager.closeAgent(original.id);
+  } finally {
+    await manager.flush();
+    await registry.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test.each([false, true])(
   "provider switch preserves the old writer when a timeline insert fails (later row: %s)",
   async (appendLaterRow) => {
@@ -11494,6 +11532,158 @@ test("provider switch rejects active turns and blocks prompts during close", asy
     rmSync(workdir, { recursive: true, force: true });
   }
 });
+
+test.each(["mode", "model", "thinking", "feature", "bundle"] as const)(
+  "provider switch drains an admitted %s change before replacing the session",
+  async (setting) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-provider-switch-setting-"));
+    const registry = new AgentStorage(join(workdir, "agents"), logger);
+    const target = new TestAgentClient("other");
+    const manager = new AgentManager({
+      clients: { codex: new TestAgentClient(), other: target },
+      registry,
+      logger,
+    });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let finished = false;
+    let settingChange: Promise<unknown> | undefined;
+    let switching: Promise<unknown> | undefined;
+    try {
+      const original = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: undefined,
+      });
+      await manager.appendTimelineItem(original.id, {
+        type: "user_message",
+        text: "Preserve this task.",
+      });
+      const session = original.session!;
+      const change = async () => {
+        entered();
+        await held;
+        finished = true;
+      };
+      session.setMode = change;
+      session.setModel = change;
+      session.setThinkingOption = change;
+      session.setFeature = change;
+      const originalClose = session.close.bind(session);
+      const close = vi.spyOn(session, "close");
+      close.mockImplementation(async () => {
+        expect(finished).toBe(true);
+        close.mockRestore();
+        await originalClose();
+      });
+      const applySetting = {
+        bundle: () =>
+          manager.updateAgentSettings(original.id, {
+            modeId: "test",
+            model: "test",
+            thinkingOptionId: "test",
+            features: { test: true },
+          }),
+        mode: () => manager.setAgentMode(original.id, "test"),
+        model: () => manager.setAgentModel(original.id, "test"),
+        thinking: () => manager.setAgentThinkingOption(original.id, "test"),
+        feature: () => manager.setAgentFeature(original.id, "test", true),
+      };
+      settingChange = applySetting[setting]();
+      await started;
+      switching = manager.switchAgentProvider(original.id, "other", "target");
+      // Observe rejection immediately while the deliberately held provider call is pending.
+      const settled = switching.then(
+        () => null,
+        (error: unknown) => error,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      release();
+      await settingChange;
+      expect(await settled).toBeNull();
+      await manager.flush();
+      const current = manager.getAgent(original.id)!;
+      const stored = await registry.get(original.id);
+      expect(current.provider).toBe("other");
+      expect(stored?.provider).toBe("other");
+      expect(stored?.persistence).toEqual(current.persistence);
+      await manager.closeAgent(original.id);
+    } finally {
+      release();
+      await Promise.allSettled([settingChange, switching]);
+      await manager.flush();
+      await registry.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each([false, true])(
+  "provider switch waits for an admitted out-of-band command (fails=%s)",
+  async (fails) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-provider-switch-command-"));
+    const registry = new AgentStorage(join(workdir, "agents"), logger);
+    const target = new TestAgentClient("other");
+    const manager = new AgentManager({
+      clients: { codex: new TestAgentClient(), other: target },
+      registry,
+      logger,
+    });
+    const held = deferred<void>();
+    const complete = deferred<void>();
+    try {
+      const original = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: undefined,
+      });
+      await manager.appendTimelineItem(original.id, {
+        type: "user_message",
+        text: "Preserve this task.",
+      });
+      original.session!.tryHandleOutOfBand = () => ({
+        run: async ({ emit }) => {
+          await held.promise;
+          try {
+            if (fails) throw new Error("command failed");
+            emit({
+              type: "timeline",
+              provider: "codex",
+              item: { type: "assistant_message", text: "Command completed" },
+            });
+          } finally {
+            complete.resolve();
+          }
+        },
+      });
+      const close = vi.spyOn(original.session!, "close");
+      expect(manager.tryRunOutOfBand(original.id, "/compact")).toBe(true);
+      await expect(manager.switchAgentProvider(original.id, "other", "target")).rejects.toThrow(
+        "out-of-band command",
+      );
+      expect(close).not.toHaveBeenCalled();
+      expect(target.createdConfigs).toHaveLength(0);
+      held.resolve();
+      await complete.promise;
+      await Promise.resolve();
+      const switched = await manager.switchAgentProvider(original.id, "other", "target");
+      expect(switched.provider).toBe("other");
+      expect(manager.getTimeline(original.id)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ text: fails ? "[Error] command failed" : "Command completed" }),
+        ]),
+      );
+      await manager.closeAgent(original.id);
+    } finally {
+      held.resolve();
+      await manager.flush();
+      await registry.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
 
 test("provider switch serializes title changes across failed target startup", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-provider-switch-title-"));

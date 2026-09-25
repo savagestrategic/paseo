@@ -734,6 +734,7 @@ export class AgentManager {
   private readonly timelineStore = new InMemoryAgentTimelineStore();
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly switchingProviders = new Set<string>();
+  private readonly outOfBandRuns = new Map<string, number>();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
   private readonly steerEventBarriers = new Map<string, SteerEventBarrier>();
@@ -1647,6 +1648,9 @@ export class AgentManager {
   }
 
   private assertProviderSwitchQuiescent(agentId: string): void {
+    if ((this.outOfBandRuns.get(agentId) ?? 0) > 0) {
+      throw new Error("Wait for the current out-of-band command before switching providers");
+    }
     const existing = this.agents.get(agentId);
     if (
       this.hasInFlightRun(agentId) ||
@@ -2103,6 +2107,15 @@ export class AgentManager {
   }
 
   async setAgentMode(agentId: string, modeId: string): Promise<AgentProviderNotice | null> {
+    return this.runSessionSettingMutation(agentId, () =>
+      this.setAgentModeUnlocked(agentId, modeId),
+    );
+  }
+
+  private async setAgentModeUnlocked(
+    agentId: string,
+    modeId: string,
+  ): Promise<AgentProviderNotice | null> {
     const agent = this.requireSessionAgent(agentId);
     const notice = (await agent.session.setMode(modeId)) ?? null;
     await this.drainSessionEvents(agentId);
@@ -2119,6 +2132,12 @@ export class AgentManager {
   }
 
   async setAgentModel(agentId: string, modelId: string | null): Promise<void> {
+    return this.runSessionSettingMutation(agentId, () =>
+      this.setAgentModelUnlocked(agentId, modelId),
+    );
+  }
+
+  private async setAgentModelUnlocked(agentId: string, modelId: string | null): Promise<void> {
     const agent = this.requireSessionAgent(agentId);
     const normalizedModelId =
       typeof modelId === "string" && modelId.trim().length > 0 ? modelId : null;
@@ -2137,6 +2156,15 @@ export class AgentManager {
   }
 
   async setAgentThinkingOption(
+    agentId: string,
+    thinkingOptionId: string | null,
+  ): Promise<AgentProviderNotice | null> {
+    return this.runSessionSettingMutation(agentId, () =>
+      this.setAgentThinkingOptionUnlocked(agentId, thinkingOptionId),
+    );
+  }
+
+  private async setAgentThinkingOptionUnlocked(
     agentId: string,
     thinkingOptionId: string | null,
   ): Promise<AgentProviderNotice | null> {
@@ -2171,8 +2199,17 @@ export class AgentManager {
   }
 
   async setAgentFeature(agentId: string, featureId: string, value: unknown): Promise<void> {
-    const agent = this.requireSessionAgent(agentId);
+    return this.runSessionSettingMutation(agentId, () =>
+      this.setAgentFeatureUnlocked(agentId, featureId, value),
+    );
+  }
 
+  private async setAgentFeatureUnlocked(
+    agentId: string,
+    featureId: string,
+    value: unknown,
+  ): Promise<void> {
+    const agent = this.requireSessionAgent(agentId);
     if (!agent.session.setFeature) {
       throw new Error("Agent session does not support setting features");
     }
@@ -2182,6 +2219,52 @@ export class AgentManager {
     agent.config.featureValues = { ...agent.config.featureValues, [featureId]: value };
     this.touchUpdatedAt(agent);
     this.emitState(agent);
+  }
+
+  async updateAgentSettings(
+    agentId: string,
+    settings: {
+      modeId?: string;
+      model?: string | null;
+      thinkingOptionId?: string | null;
+      features?: Record<string, unknown>;
+    },
+  ): Promise<void> {
+    if (
+      settings.modeId === undefined &&
+      settings.model === undefined &&
+      settings.thinkingOptionId === undefined &&
+      Object.keys(settings.features ?? {}).length === 0
+    )
+      return;
+    return this.runSessionSettingMutation(agentId, async () => {
+      if (settings.modeId !== undefined) await this.setAgentModeUnlocked(agentId, settings.modeId);
+      if (settings.model !== undefined) await this.setAgentModelUnlocked(agentId, settings.model);
+      if (settings.thinkingOptionId !== undefined)
+        await this.setAgentThinkingOptionUnlocked(agentId, settings.thinkingOptionId);
+      for (const [featureId, value] of Object.entries(settings.features ?? {})) {
+        await this.setAgentFeatureUnlocked(agentId, featureId, value);
+      }
+    });
+  }
+
+  private runSessionSettingMutation<T>(
+    agentId: string,
+    mutation: (agent: ActiveManagedAgent) => Promise<T>,
+  ): Promise<T> {
+    // Capture admission before queueing: an old-provider setting must never be
+    // applied to a replacement runtime, even if the switch was already queued.
+    const admitted = this.requireSessionAgent(agentId);
+    const admittedSession = admitted.session;
+    return this.runLifecycleMutation(agentId, async () => {
+      const current = this.requireSessionAgent(agentId);
+      if (current !== admitted || current.session !== admittedSession) {
+        throw new Error(
+          "Agent session changed before the settings update; retry on the current provider",
+        );
+      }
+      return mutation(current);
+    });
   }
 
   async setTitle(agentId: string, title: string): Promise<void> {
@@ -2572,6 +2655,7 @@ export class AgentManager {
       }
       this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
     };
+    this.outOfBandRuns.set(agentId, (this.outOfBandRuns.get(agentId) ?? 0) + 1);
     void (async () => {
       try {
         await handler.run({ emit: dispatch });
@@ -2582,6 +2666,10 @@ export class AgentManager {
           provider: agent.provider,
           item: { type: "assistant_message", text: `[Error] ${text}` },
         });
+      } finally {
+        const remaining = (this.outOfBandRuns.get(agentId) ?? 1) - 1;
+        if (remaining > 0) this.outOfBandRuns.set(agentId, remaining);
+        else this.outOfBandRuns.delete(agentId);
       }
     })();
     return true;

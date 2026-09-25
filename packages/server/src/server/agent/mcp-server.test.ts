@@ -202,6 +202,7 @@ function buildAgentManagerSpies() {
       permission: null,
       lastMessage: null,
     }),
+    updateAgentSettings: vi.fn().mockResolvedValue(undefined),
     setAgentMode: vi.fn().mockResolvedValue(undefined),
     setAgentModel: vi.fn().mockResolvedValue(undefined),
     setAgentThinkingOption: vi.fn().mockResolvedValue(undefined),
@@ -3850,10 +3851,10 @@ describe("update_agent MCP tool", () => {
 
     const response = await tool.handler(input);
 
-    expect(spies.agentManager.setAgentMode).toHaveBeenCalledWith("agent-1", "full-access");
-    expect(spies.agentManager.setAgentModel).toHaveBeenCalledWith("agent-1", "gpt-5.4");
-    expect(spies.agentManager.setAgentThinkingOption).toHaveBeenCalledWith("agent-1", "high");
-    expect(spies.agentManager.setAgentFeature).toHaveBeenCalledWith("agent-1", "fast_mode", true);
+    expect(spies.agentManager.updateAgentSettings).toHaveBeenCalledWith("agent-1", input.settings);
+    expect(spies.agentManager.updateAgentSettings.mock.invocationCallOrder[0]).toBeLessThan(
+      spies.agentManager.updateAgentMetadata.mock.invocationCallOrder[0]!,
+    );
     expect(spies.agentManager.updateAgentMetadata).toHaveBeenCalledWith("agent-1", {
       title: "Updated agent",
       labels: { role: "worker" },
@@ -3875,6 +3876,7 @@ describe("update_agent MCP tool", () => {
 
     expect(response.structuredContent).toEqual({ success: true });
     expect(spies.agentManager.updateAgentMetadata).not.toHaveBeenCalled();
+    expect(spies.agentManager.updateAgentSettings).not.toHaveBeenCalled();
     expect(spies.agentManager.setAgentMode).not.toHaveBeenCalled();
     expect(spies.agentManager.setAgentModel).not.toHaveBeenCalled();
     expect(spies.agentManager.setAgentThinkingOption).not.toHaveBeenCalled();
@@ -3883,7 +3885,7 @@ describe("update_agent MCP tool", () => {
 
   it("does not update metadata when runtime settings fail", async () => {
     const { agentManager, agentStorage, spies } = createTestDeps();
-    spies.agentManager.setAgentFeature.mockRejectedValue(new Error("unsupported feature"));
+    spies.agentManager.updateAgentSettings.mockRejectedValue(new Error("unsupported feature"));
     const server = await createAgentMcpServer({
       agentManager,
       agentStorage,

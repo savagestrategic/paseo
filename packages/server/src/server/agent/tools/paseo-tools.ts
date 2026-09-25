@@ -2176,19 +2176,8 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       },
     },
     async ({ agentId, name, labels, settings }) => {
-      if (settings?.modeId !== undefined) {
-        await agentManager.setAgentMode(agentId, settings.modeId);
-      }
-      if (settings?.model !== undefined) {
-        await agentManager.setAgentModel(agentId, settings.model);
-      }
-      if (settings?.thinkingOptionId !== undefined) {
-        await agentManager.setAgentThinkingOption(agentId, settings.thinkingOptionId);
-      }
-      if (settings?.features) {
-        for (const [featureId, value] of Object.entries(settings.features)) {
-          await agentManager.setAgentFeature(agentId, featureId, value);
-        }
+      if (settings) {
+        await agentManager.updateAgentSettings(agentId, settings);
       }
 
       await updateAgentCommand({ agentManager }, { agentId, name, labels });
