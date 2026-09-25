@@ -230,12 +230,13 @@ function addWebOverlay(entry: WebOverlayEntry): (options?: RemoveWebOverlayOptio
       document.contains(entry.restoreFocus)
     ) {
       const restoreTarget = entry.restoreFocus;
+      const restoreDocument = restoreTarget.ownerDocument;
       // Ref detach can run during React's mutation phase. Restore after the
       // commit, otherwise React can put focus back into the closing overlay.
       queueMicrotask(() => {
         const currentScope = getTopWebOverlay()?.getScope();
         if (
-          document.contains(restoreTarget) &&
+          restoreDocument.contains(restoreTarget) &&
           (!currentScope || currentScope.contains(restoreTarget))
         ) {
           restoreTarget.focus();

@@ -11471,16 +11471,62 @@ test("provider switch rejects active turns and blocks prompts during close", asy
     for await (const _ of pending) {
       /* finish test turn */
     }
+    const setFeature = vi.fn(async () => {});
+    original.session!.setFeature = setFeature;
     const switching = manager.switchAgentProvider(original.id, "other", "model");
     await client.waitForCloseToStart();
     expect(() => manager.streamAgent(original.id, "race")).toThrow("Provider switch in progress");
     expect(() => manager.tryRunOutOfBand(original.id, "/goal resume")).toThrow(
       "Provider switch in progress",
     );
+    await expect(manager.setAgentFeature(original.id, "fast_mode", true)).rejects.toThrow(
+      "Provider switch in progress",
+    );
+    expect(setFeature).not.toHaveBeenCalled();
     expect(target.createdConfigs).toHaveLength(0);
     client.finishClosing();
     expect((await switching).provider).toBe("other");
     await manager.closeAgent(original.id);
+  } finally {
+    client.finishClosing();
+    await manager.flush();
+    await registry.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("provider switch serializes title changes across failed target startup", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-provider-switch-title-"));
+  const registry = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new HeldReloadCloseClient();
+  const target = new TestAgentClient("other");
+  vi.spyOn(target, "createSession").mockRejectedValueOnce(new Error("target quota exhausted"));
+  const manager = new AgentManager({
+    clients: { codex: client, other: target },
+    registry,
+    logger,
+  });
+  try {
+    const original = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.setTitle(original.id, "Original title");
+    await manager.appendTimelineItem(original.id, {
+      type: "user_message",
+      text: "Preserve edits.",
+    });
+    const switching = manager.switchAgentProvider(original.id, "other", "model");
+    const failed = expect(switching).rejects.toThrow("target quota exhausted");
+    await client.waitForCloseToStart();
+    const titleUpdate = manager.setTitle(original.id, "Renamed while switching");
+    client.finishClosing();
+    await failed;
+    await titleUpdate;
+    expect((await registry.get(original.id))?.title).toBe("Renamed while switching");
+    await manager.updateAgentMetadata(original.id, {
+      title: "Metadata rename",
+    });
+    expect((await registry.get(original.id))?.title).toBe("Metadata rename");
   } finally {
     client.finishClosing();
     await manager.flush();
