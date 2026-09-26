@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach, afterEach } from "vitest";
+import { describe, expect, test, beforeEach, afterEach, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
@@ -145,7 +145,98 @@ describe("AgentStorage", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test("cold load keeps the current provider separate from private recovery records", async () => {
+    await storage.applySnapshot(
+      createManagedAgent({
+        provider: "claude",
+        persistence: { provider: "claude", sessionId: "original-native" },
+      }),
+    );
+    const archive = await storage.saveContinuation("agent-test", []);
+    const recoveryFile = archive.file.replace(/\.json$/, ".record.json");
+    const recovery = await fs.readFile(recoveryFile, "utf8");
+    await storage.applySnapshot(
+      createManagedAgent({
+        provider: "codex",
+        persistence: { provider: "codex", sessionId: "replacement-native" },
+      }),
+    );
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    const records = await reloaded.load();
+    expect(records).toHaveLength(1);
+    expect(await reloaded.get("agent-test")).toMatchObject({
+      provider: "codex",
+      persistence: { provider: "codex", sessionId: "replacement-native" },
+      continuations: [archive.file],
+    });
+    await reloaded.setTitle("agent-test", "Continued task");
+    expect(await fs.readFile(recoveryFile, "utf8")).toBe(recovery);
+    const restarted = new AgentStorage(storagePath, logger);
+    expect(await restarted.load()).toHaveLength(1);
+    expect(await restarted.get("agent-test")).toMatchObject({
+      provider: "codex",
+      title: "Continued task",
+    });
+  });
+
+  test("cold load does not resurrect an agent from an orphaned recovery record", async () => {
+    await storage.applySnapshot(createManagedAgent());
+    await storage.saveContinuation("agent-test", []);
+    for (const entry of await fs.readdir(storagePath, { withFileTypes: true })) {
+      if (entry.name !== ".continuations") {
+        await fs.rm(path.join(storagePath, entry.name), { recursive: true, force: true });
+      }
+    }
+    const reloaded = new AgentStorage(storagePath, logger);
+    expect(await reloaded.load()).toEqual([]);
+    expect(await reloaded.get("agent-test")).toBeNull();
+  });
+
+  test("continuation cleanup removes partial transcript and private record on write failure", async () => {
+    await storage.applySnapshot(createManagedAgent());
+    const originalOpen = fs.open.bind(fs);
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      const file = String(args[0]);
+      if (file.includes(".continuations") && !file.endsWith(".record.json")) {
+        vi.spyOn(handle, "writeFile").mockRejectedValue(new Error("disk full"));
+      }
+      return handle;
+    });
+    await expect(storage.saveContinuation("agent-test", [])).rejects.toThrow("disk full");
+    expect(await fs.readdir(path.join(storagePath, ".continuations"))).toEqual([]);
+    expect((await storage.get("agent-test"))?.continuations).toBeUndefined();
+  });
+
+  test("continuation cleanup removes both private files when tracking cannot be persisted", async () => {
+    await storage.applySnapshot(createManagedAgent());
+    vi.spyOn(fs, "rename").mockRejectedValue(new Error("registry write failed"));
+    await expect(storage.saveContinuation("agent-test", [])).rejects.toThrow(
+      "registry write failed",
+    );
+    expect(await fs.readdir(path.join(storagePath, ".continuations"))).toEqual([]);
+    expect((await storage.get("agent-test"))?.continuations).toBeUndefined();
+  });
+
+  test("continuation rejects and removes files when deletion fences its tracking mutation", async () => {
+    await storage.applySnapshot(createManagedAgent());
+    const originalOpen = fs.open.bind(fs);
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      if (String(args[0]).includes(".continuations")) storage.beginDelete("agent-test");
+      return handle;
+    });
+    await expect(storage.saveContinuation("agent-test", [])).rejects.toThrow(
+      "deletion interrupted",
+    );
+    expect(await fs.readdir(path.join(storagePath, ".continuations"))).toEqual([]);
+    await storage.remove("agent-test");
+    expect(await storage.get("agent-test")).toBeNull();
   });
 
   test("applySnapshot persists configs and snapshot metadata", async () => {

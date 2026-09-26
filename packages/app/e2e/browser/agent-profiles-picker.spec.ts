@@ -2,6 +2,7 @@ import { expect, test } from "../support/fixtures";
 import {
   applyProfileFromPicker,
   closeModelPicker,
+  drillIntoProvider,
   expectComposerDoesNotName,
   expectAgentProfilesEmptyPrompt,
   expectProfileEditTooltip,
@@ -54,8 +55,7 @@ test.describe("Agent profiles in the model picker", () => {
     page,
   }) => {
     const seed = await seedAgentProfiles([PROFILE]);
-    // A live agent is one provider's process, so the profile has to name that
-    // same provider or the picker will not offer it at all.
+    // Same-provider profiles still apply settings without replacing the session.
     const workspace = await seedMockAgentWorkspace({
       repoPrefix: "agent-profiles-picker-",
       title: "Agent profiles picker",
@@ -71,11 +71,11 @@ test.describe("Agent profiles in the model picker", () => {
         await expectComposerMode(page, "Load test");
       });
 
-      await test.step("the sole provider opens directly", async () => {
+      await test.step("the provider picker retains pinned profiles", async () => {
         await openModelPicker(page);
-        await expect(page.getByTestId("model-search-input").first()).toBeVisible();
+        await expect(page.getByTestId("model-search-all-input")).toBeVisible();
         await expect(page.getByTestId("sheet-header-back")).toHaveCount(0);
-        await expect(page.locator('[data-testid^="model-provider-"]')).toHaveCount(0);
+        await expect(page.getByTestId("model-provider-mock")).toBeVisible();
         await expectProfileVisibleForProvider(page, {
           name: PROFILE.name,
           summary: PROFILE_SUMMARY,
@@ -100,13 +100,14 @@ test.describe("Agent profiles in the model picker", () => {
         await expectComposerDoesNotName(page, PROFILE.name);
       });
 
-      await test.step("reopening returns directly to the provider models", async () => {
+      await test.step("reopening preserves the selected provider model", async () => {
         await openModelPicker(page);
-        await expect(page.getByTestId("model-search-input").first()).toBeVisible();
+        await expect(page.getByTestId("model-search-all-input")).toBeVisible();
         await expectProfileVisibleForProvider(page, {
           name: PROFILE.name,
           summary: PROFILE_SUMMARY,
         });
+        await drillIntoProvider(page, "mock");
         await expectModelRowSelected(page, { provider: "mock", modelId: "one-minute-stream" });
         await closeModelPicker(page);
       });

@@ -47,7 +47,7 @@ describe("useWebOverlayRegistration", () => {
     unmount();
   });
 
-  it("restores opener focus when an overlay closes", () => {
+  it("restores opener focus after the closing commit", async () => {
     const { result, rerender, unmount } = renderHook(
       ({ active }: { active: boolean }) =>
         useWebOverlayRegistration({ active, layer: 20, onKeyDown: () => false }),
@@ -60,12 +60,16 @@ describe("useWebOverlayRegistration", () => {
     expect(document.activeElement).toBe(input);
 
     act(() => rerender({ active: false }));
+    // React may restore the previously focused node during its mutation phase.
+    input.focus();
+    await act(async () => {});
 
+    expect(document.activeElement).toBe(opener);
     expect(openerFocus).toHaveBeenCalled();
     unmount();
   });
 
-  it("restores opener focus when an active overlay unmounts after its scope detaches", () => {
+  it("restores opener focus when an active overlay unmounts after its scope detaches", async () => {
     const { result, unmount } = renderHook(() =>
       useWebOverlayRegistration({ active: true, layer: 20, onKeyDown: () => false }),
     );
@@ -79,8 +83,53 @@ describe("useWebOverlayRegistration", () => {
     expect(openerFocus).not.toHaveBeenCalled();
 
     unmount();
+    await act(async () => {});
 
     expect(openerFocus).toHaveBeenCalled();
+  });
+
+  it("does not restore into an overlay covered by a newly opened overlay", async () => {
+    const first = renderHook(
+      ({ active }: { active: boolean }) =>
+        useWebOverlayRegistration({ active, layer: 20, onKeyDown: () => false }),
+      { initialProps: { active: true } },
+    );
+    act(() => first.result.current(scope));
+    input.focus();
+    act(() => first.rerender({ active: false }));
+
+    const nextScope = document.createElement("div");
+    const nextInput = document.createElement("input");
+    nextScope.append(nextInput);
+    document.body.append(nextScope);
+    const next = renderHook(() =>
+      useWebOverlayRegistration({ active: true, layer: 30, onKeyDown: () => false }),
+    );
+    act(() => next.result.current(nextScope));
+    nextInput.focus();
+    await act(async () => {});
+
+    expect(document.activeElement).toBe(nextInput);
+    next.unmount();
+    first.unmount();
+    await act(async () => {});
+  });
+
+  it("preserves focus assigned to a new pane or inline editor while closing", async () => {
+    const { result, rerender, unmount } = renderHook(
+      ({ active }: { active: boolean }) =>
+        useWebOverlayRegistration({ active, layer: 20, onKeyDown: () => false }),
+      { initialProps: { active: true } },
+    );
+    act(() => result.current(scope));
+    input.focus();
+    act(() => rerender({ active: false }));
+    const editor = document.createElement("input");
+    document.body.append(editor);
+    editor.focus();
+    await act(async () => {});
+    expect(document.activeElement).toBe(editor);
+    unmount();
   });
 
   it("leaves IME composition keys with the focused editor", () => {

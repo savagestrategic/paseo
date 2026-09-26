@@ -64,6 +64,12 @@ export async function ensureAgentLoaded(
   agentId: string,
   deps: EnsureAgentLoadedDeps,
 ): Promise<ManagedAgent> {
+  // Upgrade a shared load before waiting on its lifecycle lane: hydration
+  // itself now owns that lane until its deferred broadcast decision is made.
+  const pendingBeforeBarrier = pendingAgentInitializations.get(agentId);
+  if (pendingBeforeBarrier) {
+    pendingBeforeBarrier.options.broadcastTimeline ||= deps.broadcastTimeline === true;
+  }
   await deps.agentManager.waitForAgentClose?.(agentId);
 
   const inflight = pendingAgentInitializations.get(agentId);

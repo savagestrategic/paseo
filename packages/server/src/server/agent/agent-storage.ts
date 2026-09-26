@@ -1,3 +1,5 @@
+import { continuationDigest } from "./provider-continuation.js";
+import { randomUUID } from "node:crypto";
 import { promises as fs, type Dirent } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
@@ -27,6 +29,9 @@ const SERIALIZABLE_CONFIG_SCHEMA = z
       .nullable()
       .optional(),
     systemPrompt: z.string().nullable().optional(),
+    continuationArchive: z.string().optional(),
+    continuationArchiveSha256: z.string().optional(),
+    continuationPending: z.boolean().optional(),
     mcpServers: z.record(z.string(), z.any()).nullable().optional(),
   })
   .nullable()
@@ -75,6 +80,7 @@ const STORED_AGENT_SCHEMA = z.object({
   internal: z.boolean().optional(),
   archivedAt: z.string().nullable().optional(),
   owner: AgentOwnerSchema.optional(),
+  continuations: z.array(z.string()).optional(),
 });
 
 export type SerializableAgentConfig = Pick<
@@ -86,6 +92,9 @@ export type SerializableAgentConfig = Pick<
   | "providerOptions"
   | "toolPolicy"
   | "systemPrompt"
+  | "continuationArchive"
+  | "continuationArchiveSha256"
+  | "continuationPending"
   | "mcpServers"
 >;
 
@@ -214,6 +223,19 @@ export class AgentStorage {
     await this.load();
     this.beginDelete(agentId);
     await (this.pendingWrites.get(agentId) ?? Promise.resolve());
+    // Only delete generated files beneath this storage's continuation directory.
+    // Leave the record indexed if cleanup fails so deletion can be retried.
+    const continuationDir = path.resolve(this.baseDir, ".continuations");
+    for (const file of this.cache.get(agentId)?.continuations ?? []) {
+      if (
+        path.dirname(path.resolve(file)) !== continuationDir ||
+        !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.json$/.test(path.basename(file))
+      ) {
+        throw new Error("Refusing to delete an invalid continuation archive path");
+      }
+      await fs.rm(file, { force: true });
+      await fs.rm(file.replace(/\.json$/, ".record.json"), { force: true });
+    }
     const paths = Array.from(this.pathsById.get(agentId) ?? []);
     await Promise.all(
       paths.map(async (filePath) => {
@@ -259,8 +281,64 @@ export class AgentStorage {
       if (existing && existing.archivedAt !== undefined) {
         record.archivedAt = existing.archivedAt;
       }
+      record.continuations = existing?.continuations;
       return record;
     });
+  }
+
+  async saveContinuation(
+    agentId: string,
+    rows: unknown[],
+  ): Promise<{ file: string; sha256: string }> {
+    const record = await this.get(agentId);
+    if (!record) throw new Error(`Agent ${agentId} not found`);
+    const file = path.join(this.baseDir, ".continuations", `${randomUUID()}.json`);
+    await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+    // Keep sensitive recovery state separate from the model-readable transcript.
+    // Track ownership after exclusive creation so partial writes can be removed
+    // without deleting a pre-existing file if exclusive creation ever collides.
+    const created: string[] = [];
+    const writePrivate = async (target: string, contents: string) => {
+      const handle = await fs.open(target, "wx", 0o600);
+      created.push(target);
+      try {
+        await handle.writeFile(contents);
+      } finally {
+        await handle.close();
+      }
+    };
+    const contents = JSON.stringify({
+      version: 1,
+      agentId,
+      provider: record.provider,
+      cwd: record.cwd,
+      title: record.title,
+      rows,
+    });
+    try {
+      await writePrivate(file.replace(/\.json$/, ".record.json"), JSON.stringify(record));
+      await writePrivate(file, contents);
+      let tracked = false;
+      await this.queueRecordMutation(agentId, (current) => {
+        if (!current) throw new Error(`Agent ${agentId} not found`);
+        tracked = true;
+        return { ...current, continuations: [...(current.continuations ?? []), file] };
+      });
+      if (!tracked) throw new Error("Agent deletion interrupted the provider switch");
+      return { file, sha256: continuationDigest(contents) };
+    } catch (error) {
+      const cleanup = await Promise.allSettled(
+        created.map((target) => fs.rm(target, { force: true })),
+      );
+      cleanup.forEach((result, i) => {
+        if (result.status === "rejected")
+          this.logger.error(
+            { err: result.reason, file: created[i] },
+            "Continuation cleanup failed",
+          );
+      });
+      throw error;
+    }
   }
 
   async setTitle(agentId: string, title: string): Promise<void> {
@@ -330,7 +408,8 @@ export class AgentStorage {
       .map((entry) => path.join(this.baseDir, entry.name));
 
     const projectDirs = entries
-      .filter((entry) => entry.isDirectory())
+      // Private recovery records are historical snapshots, never active agent records.
+      .filter((entry) => entry.isDirectory() && entry.name !== ".continuations")
       .map((entry) => path.join(this.baseDir, entry.name));
 
     const projectFileLists = await Promise.all(

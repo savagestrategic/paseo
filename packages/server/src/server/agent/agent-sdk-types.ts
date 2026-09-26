@@ -605,6 +605,10 @@ export interface AgentSessionConfig {
    * Mapped by each provider to its native instruction field.
    */
   systemPrompt?: string;
+  /** Daemon-owned transcript supplied on subsequent prompts after a provider switch. */
+  continuationArchive?: string;
+  continuationArchiveSha256?: string;
+  continuationPending?: boolean;
   /**
    * Daemon-level instructions appended at runtime. This is deliberately not
    * persisted into agent config so daemon setting changes apply cleanly.
@@ -643,10 +647,13 @@ export interface AgentCreateSessionOptions {
   persistSession?: boolean;
 }
 
+/** What a resumed session is for: driving the agent, or reading what it already did. */
+export type AgentResumePurpose = "interactive" | "history";
+
 /** Runtime-only intent for a persisted-session resume. Never persist this option. */
 export interface AgentResumeSessionOptions {
   /** Defaults to interactive. History loading may be read-only for archived native sessions. */
-  purpose?: "interactive" | "history";
+  purpose?: AgentResumePurpose;
 }
 
 /**

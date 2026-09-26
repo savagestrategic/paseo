@@ -902,6 +902,7 @@ export class Session {
       workspaceRegistry: this.workspaceRegistry,
       projectRegistry: this.projectRegistry,
       workspaceGitService: this.workspaceGitService,
+      isDirectory: (path) => this.filesystem.isDirectory(path),
       logger: this.sessionLogger,
     });
     this.workspaceRecovery = createWorkspaceRecoveryService({
@@ -2744,6 +2745,8 @@ export class Session {
     switch (msg.type) {
       case "set_agent_mode_request":
         return this.agentConfigSession.handleSetAgentModeRequest(msg);
+      case "switch_agent_provider_request":
+        return this.handleSwitchAgentProviderRequest(msg);
       case "set_agent_model_request":
         return this.agentConfigSession.handleSetAgentModelRequest(msg);
       case "set_agent_feature_request":
@@ -4515,6 +4518,33 @@ export class Session {
           timestamp: new Date(),
           type: "error",
           content: `Failed to import agent: ${message}`,
+        },
+      });
+    }
+  }
+
+  private async handleSwitchAgentProviderRequest(
+    msg: Extract<SessionInboundMessage, { type: "switch_agent_provider_request" }>,
+  ): Promise<void> {
+    try {
+      const agent = await this.agentManager.switchAgentProvider(
+        msg.agentId,
+        msg.provider,
+        msg.model,
+      );
+      await this.agentUpdates.forwardLiveAgent(agent);
+      this.emit({
+        type: "switch_agent_provider_response",
+        payload: { agentId: msg.agentId, requestId: msg.requestId, accepted: true, error: null },
+      });
+    } catch (error) {
+      this.emit({
+        type: "switch_agent_provider_response",
+        payload: {
+          agentId: msg.agentId,
+          requestId: msg.requestId,
+          accepted: false,
+          error: getErrorMessage(error),
         },
       });
     }

@@ -3469,6 +3469,33 @@ export class DaemonClient {
     return payload.notice ?? null;
   }
 
+  async switchAgentProvider(agentId: string, provider: string, model: string): Promise<void> {
+    if (this.lastServerInfoMessage?.features?.providerSwitching !== true) {
+      throw new Error(
+        "This daemon does not support provider switching. Update Paseo or use paseo-resume in a fresh session.",
+      );
+    }
+    const requestId = this.createRequestId();
+    const message = SessionInboundMessageSchema.parse({
+      type: "switch_agent_provider_request",
+      agentId,
+      provider,
+      model,
+      requestId,
+    });
+    const payload = await this.sendRequest({
+      requestId,
+      message,
+      options: { skipQueue: true },
+      timeout: 120000,
+      select: (msg) =>
+        msg.type === "switch_agent_provider_response" && msg.payload.requestId === requestId
+          ? msg.payload
+          : null,
+    });
+    if (!payload.accepted) throw new Error(payload.error ?? "Provider switch rejected");
+  }
+
   async setAgentModel(agentId: string, modelId: string | null): Promise<void> {
     const requestId = this.createRequestId();
     const message = SessionInboundMessageSchema.parse({

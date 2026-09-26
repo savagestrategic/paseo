@@ -6899,3 +6899,51 @@ test("reviewed plugin updates gate before requests and preserve exact proposal d
     ]);
   }
 });
+
+test("provider switch correlates the response and surfaces rejection", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "switch-test",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  mock.triggerOpen({ features: { providerSwitching: true } });
+  await connecting;
+  const pending = client.switchAgentProvider("agent-1", "kimi-hr", "k3");
+  const request = parseSentFrame(mock.sent.at(-1));
+  expect(request).toMatchObject({
+    type: "switch_agent_provider_request",
+    agentId: "agent-1",
+    provider: "kimi-hr",
+    model: "k3",
+  });
+  let settled = false;
+  const rejected = expect(
+    pending.finally(() => {
+      settled = true;
+    }),
+  ).rejects.toThrow("Stop the current turn");
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "switch_agent_provider_response",
+      payload: { requestId: "unrelated", agentId: "agent-1", accepted: true, error: null },
+    }),
+  );
+  await Promise.resolve();
+  expect(settled).toBe(false);
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "switch_agent_provider_response",
+      payload: {
+        requestId: request.requestId,
+        agentId: "agent-1",
+        accepted: false,
+        error: "Stop the current turn",
+      },
+    }),
+  );
+  await rejected;
+});

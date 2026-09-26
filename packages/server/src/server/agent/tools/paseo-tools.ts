@@ -1,3 +1,4 @@
+import { stat } from "node:fs/promises";
 import { z } from "zod";
 import { ensureValidJson } from "../../json-utils.js";
 import type { Logger } from "pino";
@@ -221,6 +222,20 @@ function assertOptionsAbsent(
   if (options.some(([, value]) => value !== undefined)) {
     throw new Error(message);
   }
+}
+
+async function isExistingDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch (error) {
+    if (isMissingPathError(error)) return false;
+    throw error;
+  }
+}
+
+function isMissingPathError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  return error.code === "ENOENT" || error.code === "ENOTDIR";
 }
 
 function resolveWorkspaceWorktreeTarget(input: WorkspaceWorktreeOptions): WorkspaceWorktreeTarget {
@@ -1225,7 +1240,9 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         path: z
           .string()
           .optional()
-          .describe("Local directory or source checkout. Defaults to your current workspace."),
+          .describe(
+            "Local directory or source checkout. Defaults to your current workspace. Local isolation adopts an existing directory and never creates one.",
+          ),
         projectId: z.string().optional().describe("Existing project id to own the workspace."),
         title: z.string().trim().min(1).optional(),
         mode: z
@@ -1277,6 +1294,9 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       let workspace: PersistedWorkspaceRecord;
       if (isolation === "local") {
         const cwd = resolveScopedCwd(path, { required: true });
+        if (!(await isExistingDirectory(cwd))) {
+          throw new Error(`Directory not found: ${cwd}`);
+        }
         assertOptionsAbsent(
           [
             ["mode", mode],
@@ -2156,19 +2176,8 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       },
     },
     async ({ agentId, name, labels, settings }) => {
-      if (settings?.modeId !== undefined) {
-        await agentManager.setAgentMode(agentId, settings.modeId);
-      }
-      if (settings?.model !== undefined) {
-        await agentManager.setAgentModel(agentId, settings.model);
-      }
-      if (settings?.thinkingOptionId !== undefined) {
-        await agentManager.setAgentThinkingOption(agentId, settings.thinkingOptionId);
-      }
-      if (settings?.features) {
-        for (const [featureId, value] of Object.entries(settings.features)) {
-          await agentManager.setAgentFeature(agentId, featureId, value);
-        }
+      if (settings) {
+        await agentManager.updateAgentSettings(agentId, settings);
       }
 
       await updateAgentCommand({ agentManager }, { agentId, name, labels });

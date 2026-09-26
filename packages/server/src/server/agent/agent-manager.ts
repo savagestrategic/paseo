@@ -1,8 +1,14 @@
+import {
+  continuationPrefix,
+  readContinuationRows,
+  stripContinuationPrefix,
+} from "./provider-continuation.js";
 import { projectTimelineRows } from "./timeline-projection.js";
 import type { PluginLifecycle } from "../plugins/lifecycle/index.js";
 import { describeHookAgent, publishAgentStream } from "../plugins/lifecycle/index.js";
 import type { PluginSessionOpenRequest } from "@getpaseo/plugin/server";
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { basename, resolve } from "node:path";
 import { stat } from "node:fs/promises";
 import {
@@ -27,6 +33,7 @@ import {
   type AgentCapabilityFlags,
   type AgentClient,
   type AgentCreateSessionOptions,
+  type AgentResumePurpose,
   type AgentResumeSessionOptions,
   type AgentFeature,
   type AgentLaunchContext,
@@ -139,6 +146,28 @@ export type AgentRunCancellationResult =
   | { status: "settled" }
   | { status: "refused" };
 
+/** A session that will run in a directory needs that directory to be there. */
+async function assertUsableWorkingDirectory(cwd: string): Promise<void> {
+  try {
+    const stats = await stat(cwd);
+    if (!stats.isDirectory()) {
+      throw new Error(`Working directory is not a directory: ${cwd}`);
+    }
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      (error as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      throw new Error(`Working directory does not exist: ${cwd}`, { cause: error });
+    }
+    if (error instanceof Error) {
+      throw error;
+    }
+    throw new Error(`Failed to access working directory: ${cwd}`, { cause: error });
+  }
+}
+
 interface PreparedSessionConfig {
   storedConfig: AgentSessionConfig;
   launchConfig: AgentSessionConfig;
@@ -148,6 +177,8 @@ interface PreparedSessionConfig {
 interface NormalizeConfigOptions {
   resolveDefaultModel?: boolean;
   env?: Record<string, string>;
+  /** Defaults to interactive. A history load reads persisted state and runs nothing. */
+  purpose?: AgentResumePurpose;
 }
 
 interface TimeoutOptions {
@@ -180,6 +211,9 @@ function buildStoredAgentConfig(record: StoredAgentRecord): AgentSessionConfig {
     config.providerOptions = record.config.providerOptions;
   }
   if (record.config.toolPolicy != null) config.toolPolicy = record.config.toolPolicy;
+  config.continuationArchive = record.config.continuationArchive;
+  config.continuationArchiveSha256 = record.config.continuationArchiveSha256;
+  config.continuationPending = record.config.continuationPending;
   if (record.config.systemPrompt != null) {
     config.systemPrompt = record.config.systemPrompt;
   }
@@ -699,6 +733,9 @@ export class AgentManager {
   private readonly agents = new Map<string, LiveManagedAgent>();
   private readonly timelineStore = new InMemoryAgentTimelineStore();
   private readonly providerSubagents = new ProviderSubagentStore();
+  private readonly switchingProviders = new Set<string>();
+  private readonly outOfBandRuns = new Map<string, number>();
+  private readonly pendingRewinds = new Map<string, number>();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
   private readonly steerEventBarriers = new Map<string, SteerEventBarrier>();
@@ -1229,7 +1266,7 @@ export class AgentManager {
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
       config,
       resolvedAgentId,
-      options?.env,
+      { env: options?.env },
     );
     this.requireEnabledProvider(storedConfig.provider);
     const client = await this.requireAvailableClient({
@@ -1331,17 +1368,21 @@ export class AgentManager {
       ...overrides,
       provider: handle.provider,
     } as AgentSessionConfig;
-    const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
-      mergedConfig,
-      resolvedAgentId,
-    );
-
     // Decide residency from durable state inside the lifecycle lane. A loader may
-    // have read the record before a queued archive or restore completed.
+    // have read the record before a queued archive or restore completed. Residency is
+    // settled before the config is prepared, because a history load reads an archived
+    // agent whose working directory may be gone.
     const record = this.registry ? await this.registry.get(resolvedAgentId) : null;
     const currentResumeOptions = record
       ? { purpose: record.archivedAt ? ("history" as const) : ("interactive" as const) }
       : resumeOptions;
+    const purpose = currentResumeOptions?.purpose ?? "interactive";
+
+    const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
+      mergedConfig,
+      resolvedAgentId,
+      { purpose },
+    );
     const client = this.requireClient(handle.provider);
     const available = await client.isAvailable();
     if (!available) {
@@ -1358,7 +1399,7 @@ export class AgentManager {
       undefined,
       {
         reason: "resume",
-        purpose: currentResumeOptions?.purpose ?? "interactive",
+        purpose,
         workspaceId: options?.workspaceId ?? null,
       },
     );
@@ -1474,6 +1515,203 @@ export class AgentManager {
         this.reloadAgentSessionInternal(agentId, overrides, options),
       ),
     );
+  }
+
+  /** A new native runtime, retaining the durable Paseo conversation and checkout. */
+  switchAgentProvider(agentId: string, provider: string, model: string): Promise<ManagedAgent> {
+    return this.trackAgentRegistrationOperation(
+      this.runLifecycleMutation(agentId, async () => {
+        this.switchingProviders.add(agentId);
+        try {
+          this.assertAcceptingAgentRegistrations();
+          const registry = this.requireRegistry();
+          const original = await registry.get(agentId);
+          if (!original || original.internal || original.archivedAt) {
+            throw new Error("Select an existing, unarchived conversation to switch providers");
+          }
+          if (original.owner?.kind === "daemon") {
+            throw new Error("Managed executions must switch through their owning controller");
+          }
+          const existing = this.agents.get(agentId);
+          this.assertProviderSwitchQuiescent(agentId);
+          const { targetClient, prepared, env } = await this.prepareProviderSwitchTarget(
+            agentId,
+            original,
+            provider,
+            model,
+          );
+          const launchContext = await this.buildLaunchContext(
+            agentId,
+            targetClient,
+            original.cwd,
+            prepared.paseoToolPolicy,
+            env,
+            { reason: "create", purpose: "interactive", workspaceId: original.workspaceId ?? null },
+          );
+          // Prompts and settings are excluded while this lifecycle operation owns the agent.
+          // Prove retained history before closing the old writer.
+          const rows = await this.readProviderSwitchRows(agentId);
+          this.assertProviderSwitchQuiescent(agentId);
+          let archive = await registry.saveContinuation(agentId, rows);
+          if (existing) {
+            await this.closeReloadedSession(existing.session, agentId);
+            // Stop admission from the old subscription, then finish every event
+            // emitted through close before finalizing the retained transcript.
+            existing.unsubscribeSession?.();
+            existing.unsubscribeSession = null;
+            await this.drainSessionEvents(agentId);
+            this.cancelRunningProviderSubagents(agentId);
+            const closed = this.prepareAgentForClosure(existing, "provider switched");
+            await this.persistSnapshot(closed);
+            this.emitClosedAgent(closed, { persist: false });
+            const finalRows = await this.readProviderSwitchRows(agentId);
+            if (!isDeepStrictEqual(rows, finalRows)) {
+              // The first checkpoint remains recoverable if final persistence
+              // fails. Never start the target with an incomplete closing segment.
+              archive = await registry.saveContinuation(agentId, finalRows);
+            }
+          }
+          const storedConfig = {
+            ...prepared.storedConfig,
+            continuationArchive: archive.file,
+            continuationArchiveSha256: archive.sha256,
+            continuationPending: true,
+          };
+          const launchConfig = {
+            ...prepared.launchConfig,
+            continuationArchive: archive.file,
+            continuationArchiveSha256: archive.sha256,
+            continuationPending: true,
+          };
+          let session: AgentSession | undefined;
+          try {
+            this.paseoToolPolicies.set(agentId, prepared.paseoToolPolicy);
+            session = await targetClient.createSession(
+              this.resolveProviderLaunchConfig(launchConfig, launchContext),
+              launchContext,
+            );
+            await this.requireExternalMcpSupport(session, storedConfig);
+            return await this.registerSession(session, storedConfig, agentId, {
+              publishWhenReady: true,
+              labels: original.labels,
+              workspaceId: original.workspaceId,
+              owner: original.owner,
+              createdAt: new Date(original.createdAt),
+              lastUserMessageAt: original.lastUserMessageAt
+                ? new Date(original.lastUserMessageAt)
+                : null,
+              initialTitle: original.title,
+              historyPrimed: true,
+              restoring: true,
+            });
+          } catch (error) {
+            if (session) {
+              // If registration failed halfway through, retain ownership until close succeeds.
+              await this.closeReloadedSession(session, agentId);
+              const failed = this.agents.get(agentId);
+              if (failed) this.prepareAgentForClosure(failed, "provider switch failed");
+            }
+            const latest = await registry.get(agentId);
+            await registry.upsert({
+              ...original,
+              lastStatus: "closed",
+              continuations: latest?.continuations,
+            });
+            throw error;
+          }
+        } finally {
+          this.switchingProviders.delete(agentId);
+        }
+      }),
+    );
+  }
+
+  private async readProviderSwitchRows(agentId: string): Promise<AgentTimelineRow[]> {
+    await this.drainSessionEvents(agentId);
+    await this.flush();
+    const rows = this.durableTimelineStore
+      ? await this.durableTimelineStore.getCommittedRows(agentId)
+      : this.timelineStore.getRows(agentId);
+    if (!rows.length)
+      throw new Error(
+        "No retained timeline is available. Recover the original transcript before switching.",
+      );
+    if (this.durableTimelineStore && this.timelineStore.has(agentId)) {
+      const committed = projectTimelineRows({ rows, mode: "projected" }).map((row) => ({
+        seq: row.seqEnd,
+        item: row.item,
+      }));
+      const visible = this.timelineStore.getRows(agentId).map((row) => ({
+        seq: row.seqEnd,
+        item: row.item,
+      }));
+      // Background persistence is best-effort. Require the complete visible
+      // projection before giving up the original writer, including a missing
+      // middle row or a failed update with an unchanged latest sequence.
+      if (
+        !isDeepStrictEqual(
+          JSON.parse(JSON.stringify(committed)),
+          JSON.parse(JSON.stringify(visible)),
+        )
+      ) {
+        throw new Error(
+          "Retained timeline is not fully persisted. Recover the original transcript before switching.",
+        );
+      }
+    }
+    return rows;
+  }
+
+  private assertProviderSwitchQuiescent(agentId: string): void {
+    if ((this.outOfBandRuns.get(agentId) ?? 0) > 0) {
+      throw new Error("Wait for the current out-of-band command before switching providers");
+    }
+    const existing = this.agents.get(agentId);
+    if (
+      this.hasInFlightRun(agentId) ||
+      existing?.lifecycle === "initializing" ||
+      existing?.pendingPermissions.size ||
+      existing?.inFlightPermissionResponses.size ||
+      this.providerSubagents.list(agentId).some((child) => child.status === "running")
+    ) {
+      throw new Error("Stop the current turn and resolve permissions before switching providers");
+    }
+  }
+
+  private async prepareProviderSwitchTarget(
+    agentId: string,
+    original: StoredAgentRecord,
+    provider: string,
+    model: string,
+  ) {
+    this.requireEnabledProvider(provider);
+    const client = await this.requireAvailableClient({ provider });
+    // Resolve target settings independently. Provider-native modes, options, and
+    // permission shortcuts must never bleed into the replacement runtime.
+    let config: AgentSessionConfig = {
+      provider,
+      model,
+      cwd: original.cwd,
+      title: original.title ?? undefined,
+      systemPrompt: original.config?.systemPrompt ?? undefined,
+      mcpServers: original.config?.mcpServers ?? undefined,
+    };
+    let env: Record<string, string> | undefined;
+    if (this.pluginLifecycle) {
+      const request = await this.pluginLifecycle.before("agent.create", { config });
+      // A user conversation must remain visible and persisted after plugin transforms.
+      config = { ...request.config, internal: false };
+      env = request.env;
+    }
+    if (config.cwd !== original.cwd)
+      throw new Error("A provider switch must keep the original working directory");
+    this.requireEnabledProvider(config.provider);
+    const targetClient =
+      config.provider === provider
+        ? client
+        : await this.requireAvailableClient({ provider: config.provider });
+    const prepared = await this.prepareSessionConfig(config, agentId, { env });
+    return { targetClient, prepared, env };
   }
 
   private async reloadAgentSessionInternal(
@@ -1804,7 +2042,7 @@ export class AgentManager {
     });
 
     if (this.agents.has(record.id)) {
-      this.notifyAgentState(record.id);
+      await this.notifyAgentStateUnlocked(record.id);
     } else if (!archivedRecord.internal) {
       this.dispatchStoredAgentState(archivedRecord);
     }
@@ -1885,6 +2123,13 @@ export class AgentManager {
   }
 
   async setAgentMode(agentId: string, modeId: string): Promise<AgentProviderNotice | null> {
+    return this.runSessionMutation(agentId, () => this.setAgentModeUnlocked(agentId, modeId));
+  }
+
+  private async setAgentModeUnlocked(
+    agentId: string,
+    modeId: string,
+  ): Promise<AgentProviderNotice | null> {
     const agent = this.requireSessionAgent(agentId);
     const notice = (await agent.session.setMode(modeId)) ?? null;
     await this.drainSessionEvents(agentId);
@@ -1901,6 +2146,10 @@ export class AgentManager {
   }
 
   async setAgentModel(agentId: string, modelId: string | null): Promise<void> {
+    return this.runSessionMutation(agentId, () => this.setAgentModelUnlocked(agentId, modelId));
+  }
+
+  private async setAgentModelUnlocked(agentId: string, modelId: string | null): Promise<void> {
     const agent = this.requireSessionAgent(agentId);
     const normalizedModelId =
       typeof modelId === "string" && modelId.trim().length > 0 ? modelId : null;
@@ -1919,6 +2168,15 @@ export class AgentManager {
   }
 
   async setAgentThinkingOption(
+    agentId: string,
+    thinkingOptionId: string | null,
+  ): Promise<AgentProviderNotice | null> {
+    return this.runSessionMutation(agentId, () =>
+      this.setAgentThinkingOptionUnlocked(agentId, thinkingOptionId),
+    );
+  }
+
+  private async setAgentThinkingOptionUnlocked(
     agentId: string,
     thinkingOptionId: string | null,
   ): Promise<AgentProviderNotice | null> {
@@ -1953,8 +2211,17 @@ export class AgentManager {
   }
 
   async setAgentFeature(agentId: string, featureId: string, value: unknown): Promise<void> {
-    const agent = this.requireAgent(agentId);
+    return this.runSessionMutation(agentId, () =>
+      this.setAgentFeatureUnlocked(agentId, featureId, value),
+    );
+  }
 
+  private async setAgentFeatureUnlocked(
+    agentId: string,
+    featureId: string,
+    value: unknown,
+  ): Promise<void> {
+    const agent = this.requireSessionAgent(agentId);
     if (!agent.session.setFeature) {
       throw new Error("Agent session does not support setting features");
     }
@@ -1966,7 +2233,61 @@ export class AgentManager {
     this.emitState(agent);
   }
 
+  async updateAgentSettings(
+    agentId: string,
+    settings: {
+      modeId?: string;
+      model?: string | null;
+      thinkingOptionId?: string | null;
+      features?: Record<string, unknown>;
+    },
+  ): Promise<void> {
+    if (
+      settings.modeId === undefined &&
+      settings.model === undefined &&
+      settings.thinkingOptionId === undefined &&
+      Object.keys(settings.features ?? {}).length === 0
+    )
+      return;
+    return this.runSessionMutation(agentId, async () => {
+      if (settings.modeId !== undefined) await this.setAgentModeUnlocked(agentId, settings.modeId);
+      if (settings.model !== undefined) await this.setAgentModelUnlocked(agentId, settings.model);
+      if (settings.thinkingOptionId !== undefined)
+        await this.setAgentThinkingOptionUnlocked(agentId, settings.thinkingOptionId);
+      for (const [featureId, value] of Object.entries(settings.features ?? {})) {
+        await this.setAgentFeatureUnlocked(agentId, featureId, value);
+      }
+    });
+  }
+
+  private runSessionMutation<T>(
+    agentId: string,
+    mutation: (agent: ActiveManagedAgent) => Promise<T>,
+    onClosed?: () => Promise<T>,
+  ): Promise<T> {
+    // Capture admission before queueing: work for an old session must never be
+    // applied to a replacement runtime, even if the switch was already queued.
+    const admitted = this.requireSessionAgent(agentId);
+    const admittedSession = admitted.session;
+    return this.runLifecycleMutation(agentId, async () => {
+      if (!this.agents.has(agentId) && onClosed) return onClosed();
+      const current = this.requireSessionAgent(agentId);
+      if (current !== admitted || current.session !== admittedSession) {
+        throw new Error("Agent session changed before the update; retry on the current provider");
+      }
+      return mutation(current);
+    });
+  }
+
   async setTitle(agentId: string, title: string): Promise<void> {
+    const normalizedTitle = title.trim();
+    if (!normalizedTitle) return;
+    await this.runLifecycleMutation(agentId, () =>
+      this.updateAgentMetadataUnlocked(agentId, { title: normalizedTitle }),
+    );
+  }
+
+  private async setTitleUnlocked(agentId: string, title: string): Promise<void> {
     const agent = this.requireAgent(agentId);
     const normalizedTitle = title.trim();
     if (!normalizedTitle) {
@@ -2076,15 +2397,26 @@ export class AgentManager {
   }
 
   notifyAgentState(agentId: string): void {
+    // Resolve the current instance inside the lane; never persist a captured
+    // old instance after a provider replacement.
+    void this.runLifecycleMutation(agentId, () => this.notifyAgentStateUnlocked(agentId)).catch(
+      (err) => this.logger.warn({ err, agentId }, "Failed to notify agent state"),
+    );
+  }
+
+  private async notifyAgentStateUnlocked(agentId: string): Promise<void> {
     const agent = this.agents.get(agentId);
-    if (!agent || agent.internal) {
-      return;
-    }
+    if (!agent || agent.internal) return;
     this.touchUpdatedAt(agent);
-    this.emitState(agent);
+    await this.persistSnapshot(agent);
+    this.emitState(agent, { persist: false });
   }
 
   async clearAgentAttention(agentId: string): Promise<void> {
+    return this.runLifecycleMutation(agentId, () => this.clearAgentAttentionUnlocked(agentId));
+  }
+
+  private async clearAgentAttentionUnlocked(agentId: string): Promise<void> {
     const agent = this.requireAgent(agentId);
     if (agent.attention.requiresAttention) {
       agent.attention = { requiresAttention: false };
@@ -2094,6 +2426,10 @@ export class AgentManager {
   }
 
   async markAgentUnread(agentId: string): Promise<void> {
+    return this.runLifecycleMutation(agentId, () => this.markAgentUnreadUnlocked(agentId));
+  }
+
+  private async markAgentUnreadUnlocked(agentId: string): Promise<void> {
     const liveAgent = this.agents.get(agentId);
     if (liveAgent) {
       const isFinished = liveAgent.lifecycle === "idle";
@@ -2204,7 +2540,7 @@ export class AgentManager {
     });
 
     if (this.getAgent(agentId)) {
-      this.notifyAgentState(agentId);
+      await this.notifyAgentStateUnlocked(agentId);
     }
     return true;
   }
@@ -2246,7 +2582,7 @@ export class AgentManager {
     const liveAgent = this.getAgent(agentId);
     if (liveAgent) {
       if (updates.title) {
-        await this.setTitle(agentId, updates.title);
+        await this.setTitleUnlocked(agentId, updates.title);
       }
       if (updates.labels) {
         await this.writeLabels(agentId, updates.labels);
@@ -2323,6 +2659,9 @@ export class AgentManager {
    */
   tryRunOutOfBand(agentId: string, prompt: AgentPromptInput, options?: AgentRunOptions): boolean {
     const agent = this.requireSessionAgent(agentId);
+    if (this.pendingRewinds.has(agentId)) {
+      throw new Error(`Agent ${agentId} already has an active run`);
+    }
     const handler = agent.session.tryHandleOutOfBand?.(prompt);
     if (!handler) {
       return false;
@@ -2346,6 +2685,7 @@ export class AgentManager {
       }
       this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
     };
+    this.outOfBandRuns.set(agentId, (this.outOfBandRuns.get(agentId) ?? 0) + 1);
     void (async () => {
       try {
         await handler.run({ emit: dispatch });
@@ -2356,6 +2696,10 @@ export class AgentManager {
           provider: agent.provider,
           item: { type: "assistant_message", text: `[Error] ${text}` },
         });
+      } finally {
+        const remaining = (this.outOfBandRuns.get(agentId) ?? 1) - 1;
+        if (remaining > 0) this.outOfBandRuns.set(agentId, remaining);
+        else this.outOfBandRuns.delete(agentId);
       }
     })();
     return true;
@@ -2365,7 +2709,14 @@ export class AgentManager {
     agentId: string,
     item: AgentTimelineItem,
   ): Promise<{ seq: number; epoch: string }> {
-    const agent = this.requireAgent(agentId);
+    return this.runSessionMutation(agentId, () => this.appendTimelineItemUnlocked(agentId, item));
+  }
+
+  private async appendTimelineItemUnlocked(
+    agentId: string,
+    item: AgentTimelineItem,
+  ): Promise<{ seq: number; epoch: string }> {
+    const agent = this.requireSessionAgent(agentId);
     item = limitAgentTimelineItemContent(item);
     this.touchUpdatedAt(agent);
     const row = this.recordTimeline(agentId, item);
@@ -2387,7 +2738,7 @@ export class AgentManager {
   }
 
   async emitLiveTimelineItem(agentId: string, item: AgentTimelineItem): Promise<void> {
-    const agent = this.requireAgent(agentId);
+    const agent = this.requireSessionAgent(agentId);
     this.touchUpdatedAt(agent);
     this.dispatchStream(agentId, {
       type: "timeline",
@@ -2405,7 +2756,20 @@ export class AgentManager {
   }): Promise<string> {
     const { agent, agentId, pendingRun, prompt, options } = params;
     try {
-      const result = await agent.session.startTurn(prompt, options);
+      const archive = agent.config.continuationArchive;
+      if (archive && agent.config.continuationPending) {
+        await readContinuationRows(archive, agent.config.continuationArchiveSha256, agent.id);
+      }
+      const context =
+        archive && agent.config.continuationPending ? continuationPrefix(archive) : "";
+      let continuedPrompt: AgentPromptInput = prompt;
+      if (context) {
+        continuedPrompt =
+          typeof prompt === "string"
+            ? context + prompt
+            : [{ type: "text", text: context }, ...prompt];
+      }
+      const result = await agent.session.startTurn(continuedPrompt, options);
       if (pendingRun.settled) {
         throw new Error(`Agent ${agentId} run was canceled before its turn started`);
       }
@@ -2455,7 +2819,11 @@ export class AgentManager {
       },
       "agent.manager.stream.request",
     );
-    if (existingAgent.activeForegroundTurnId || this.runs.hasRun(agentId)) {
+    if (
+      existingAgent.activeForegroundTurnId ||
+      this.runs.hasRun(agentId) ||
+      this.pendingRewinds.has(agentId)
+    ) {
       this.logger.trace(
         {
           agentId,
@@ -2528,7 +2896,7 @@ export class AgentManager {
         if (isAcceptedTurnStart || stagedEvent === stagedSubmittedPromptEcho) {
           continue;
         }
-        this.enqueueSessionEvent(agent.id, stagedEvent);
+        this.enqueueSessionEvent(agent.id, stagedEvent, agent.session);
       }
       this.emitState(agent);
       this.logger.trace(
@@ -2762,7 +3130,7 @@ export class AgentManager {
           this.steerEventBarriers.delete(agent.id);
         }
         for (const event of barrier.events) {
-          this.enqueueSessionEvent(agent.id, event);
+          this.enqueueSessionEvent(agent.id, event, agent.session);
         }
         await this.drainSessionEvents(agent.id);
       }
@@ -2945,7 +3313,7 @@ export class AgentManager {
     requestId: string,
     response: AgentPermissionResponse,
   ): Promise<AgentPermissionResult | void> {
-    const agent = this.requireAgent(agentId);
+    const agent = this.requireSessionAgent(agentId);
     if (agent.inFlightPermissionResponses.has(requestId)) {
       throw new Error("A response to this permission request is already being submitted");
     }
@@ -3101,12 +3469,60 @@ export class AgentManager {
     agentId: string,
     options?: HydrateTimelineOptions,
   ): Promise<void> {
+    return this.runSessionMutation(
+      agentId,
+      () => this.hydrateTimelineFromProviderUnlocked(agentId, options),
+      // A queued archive/close can retire a shared load before hydration starts.
+      // There is nothing left to hydrate; a replacement instance still rejects.
+      async () => {},
+    );
+  }
+
+  private async hydrateTimelineFromProviderUnlocked(
+    agentId: string,
+    options?: HydrateTimelineOptions,
+  ): Promise<void> {
     const agent = this.requireSessionAgent(agentId);
+    if (agent.config.continuationArchive && (!agent.historyPrimed || options?.force)) {
+      // A provider only knows its own segment. Rebuild it after the archived
+      // conversation, including on a cold daemon restart.
+      const broadcast = options?.broadcast ?? false;
+      const broadcastTimeline = options?.broadcastTimeline ?? broadcast;
+      await this.forceHydrateTimelineFromLegacyProviderHistory(
+        agent,
+        typeof broadcast === "function" ? broadcast() : broadcast,
+        typeof broadcastTimeline === "function" ? broadcastTimeline() : broadcastTimeline,
+      );
+      return;
+    }
     await this.hydrateTimelineFromLegacyProviderHistory(agent, options);
   }
 
   async rewind(agentId: string, messageId: string, mode: RewindMode): Promise<void> {
+    // Block new prompts synchronously, including while waiting for the lifecycle
+    // lane or cancellation of an existing run. Keep this separate from run state
+    // so rewind can still cancel the actual foreground turn after admission.
+    this.pendingRewinds.set(agentId, (this.pendingRewinds.get(agentId) ?? 0) + 1);
+    try {
+      await this.runSessionMutation(agentId, () => this.rewindUnlocked(agentId, messageId, mode));
+    } finally {
+      const remaining = (this.pendingRewinds.get(agentId) ?? 1) - 1;
+      if (remaining > 0) this.pendingRewinds.set(agentId, remaining);
+      else this.pendingRewinds.delete(agentId);
+    }
+  }
+
+  private async rewindUnlocked(
+    agentId: string,
+    messageId: string,
+    mode: RewindMode,
+  ): Promise<void> {
     const agent = this.requireSessionAgent(agentId);
+    if (agent.config.continuationArchive) {
+      throw new Error(
+        "Rewind is unavailable across provider changes. The original transcript is retained in the continuation archive.",
+      );
+    }
     const submittedRow = this.timelineStore
       .getRows(agentId)
       .find(
@@ -3132,7 +3548,7 @@ export class AgentManager {
       );
       await invokeRewindCapability(agent.session, { messageId: providerMessageId, mode });
       if (mode !== "files") {
-        await this.hydrateTimelineFromProvider(agentId, {
+        await this.hydrateTimelineFromProviderUnlocked(agentId, {
           force: true,
           broadcast: true,
           broadcastTimeline: false,
@@ -3595,7 +4011,14 @@ export class AgentManager {
       workspaceId: options?.workspaceId,
       owner: options?.owner,
       session,
-      capabilities: session.capabilities,
+      capabilities: config.continuationArchive
+        ? {
+            ...session.capabilities,
+            supportsRewindConversation: false,
+            supportsRewindFiles: false,
+            supportsRewindBoth: false,
+          }
+        : session.capabilities,
       config,
       runtimeInfo: undefined,
       lifecycle: "initializing",
@@ -3691,13 +4114,23 @@ export class AgentManager {
       return;
     }
     const agentId = agent.id;
-    const unsubscribe = agent.session.subscribe((event: AgentStreamEvent) => {
-      this.enqueueSessionEvent(agentId, event);
+    const sourceSession = agent.session;
+    let subscribed = true;
+    const unsubscribe = sourceSession.subscribe((event: AgentStreamEvent) => {
+      if (subscribed) this.enqueueSessionEvent(agentId, event, sourceSession);
     });
-    agent.unsubscribeSession = unsubscribe;
+    agent.unsubscribeSession = () => {
+      subscribed = false;
+      unsubscribe();
+    };
   }
 
-  private enqueueSessionEvent(agentId: string, event: AgentStreamEvent): void {
+  private enqueueSessionEvent(
+    agentId: string,
+    event: AgentStreamEvent,
+    sourceSession: AgentSession,
+  ): void {
+    if (this.agents.get(agentId)?.session !== sourceSession) return;
     this.logger.trace(
       {
         agentId,
@@ -3726,7 +4159,7 @@ export class AgentManager {
         if (!current) {
           return;
         }
-        if (current.session == null) {
+        if (current.session !== sourceSession) {
           return;
         }
         this.logger.trace(
@@ -3863,16 +4296,23 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     options?: { emit?: boolean },
   ): Promise<void> {
+    const session = agent.session;
+    const isCurrent = () => this.agents.get(agent.id) === agent && agent.session === session;
     try {
-      const modes = await agent.session.getAvailableModes();
+      const modes = await session.getAvailableModes();
+      if (!isCurrent()) return;
       agent.availableModes = modes;
     } catch {
+      if (!isCurrent()) return;
       agent.availableModes = [];
     }
 
     try {
-      agent.currentModeId = await agent.session.getCurrentMode();
+      const mode = await session.getCurrentMode();
+      if (!isCurrent()) return;
+      agent.currentModeId = mode;
     } catch {
+      if (!isCurrent()) return;
       agent.currentModeId = null;
     }
 
@@ -3891,8 +4331,12 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     options?: { emit?: boolean },
   ): Promise<void> {
+    const session = agent.session;
     try {
-      const newInfo = await agent.session.getRuntimeInfo();
+      const newInfo = await session.getRuntimeInfo();
+      // Terminal event refreshes are detached from the event queue and may
+      // resolve after close/replacement. Never publish or persist that writer.
+      if (this.agents.get(agent.id) !== agent || agent.session !== session) return;
       const changed =
         newInfo.model !== agent.runtimeInfo?.model ||
         newInfo.thinkingOptionId !== agent.runtimeInfo?.thinkingOptionId ||
@@ -3942,6 +4386,13 @@ export class AgentManager {
     broadcast: boolean,
     broadcastTimeline: boolean,
   ): Promise<void> {
+    const retainedRows = agent.config.continuationArchive
+      ? await readContinuationRows(
+          agent.config.continuationArchive,
+          agent.config.continuationArchiveSha256,
+          agent.id,
+        )
+      : [];
     const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
     const providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
     for await (const rawEvent of agent.session.streamHistory()) {
@@ -3950,7 +4401,10 @@ export class AgentManager {
         if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
           continue;
         }
-        historyEvents.push(event);
+        historyEvents.push({
+          ...event,
+          item: stripContinuationPrefix(event.item, agent.config.continuationArchive),
+        });
       } else if (event.type === "provider_subagent") {
         providerSubagentEvents.push(event);
       }
@@ -3959,7 +4413,11 @@ export class AgentManager {
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
     await this.deleteCommittedTimeline(agent.id);
     this.timelineStore.delete(agent.id);
-    this.timelineStore.initialize(agent.id, { timestamp: new Date().toISOString() });
+    this.timelineStore.initialize(agent.id, {
+      rows: retainedRows,
+      timestamp: new Date().toISOString(),
+    });
+    this.enqueueDurableTimelineBulkInsert(agent.id, retainedRows);
     agent.historyPrimed = true;
 
     for (const event of this.providerSubagents.deleteParent(agent.id)) {
@@ -3996,23 +4454,17 @@ export class AgentManager {
     broadcast: boolean | (() => boolean),
   ): Promise<void> {
     const deferredBroadcast = typeof broadcast === "function";
-    const timelineEvents: Array<{
-      event: Extract<AgentStreamEvent, { type: "timeline" }>;
-      row: AgentTimelineRow;
-    }> = [];
-    const providerSubagentEvents: AgentManagerEvent[] = [];
+    const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
+    const historySubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
     agent.historyPrimed = false;
     try {
+      // Collect the whole replay before touching either store. A stream that fails
+      // halfway then leaves the committed timeline as it was, instead of a partial
+      // copy the next attempt would append to.
       for await (const rawEvent of agent.session.streamHistory()) {
         const event = limitAgentStreamEventContent(rawEvent);
         if (event.type === "provider_subagent") {
-          const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
-          const managerEvent: AgentManagerEvent = { type: "provider_subagent", event: update };
-          if (deferredBroadcast) {
-            providerSubagentEvents.push(managerEvent);
-          } else if (broadcast) {
-            this.dispatch(managerEvent);
-          }
+          historySubagentEvents.push(event);
           continue;
         }
         if (event.type !== "timeline") {
@@ -4021,24 +4473,46 @@ export class AgentManager {
         if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
           continue;
         }
-        const row = this.recordTimeline(
-          agent.id,
-          event.item,
-          event.timestamp ? { timestamp: event.timestamp } : undefined,
-        );
-        if (deferredBroadcast) {
-          timelineEvents.push({ event, row });
-        } else if (broadcast) {
-          this.dispatchStream(agent.id, event, {
-            seq: row.seq,
-            epoch: this.timelineStore.getEpoch(agent.id),
-            timestamp: row.timestamp,
-          });
-        }
+        historyEvents.push(event);
       }
     } catch (error) {
       this.logger.warn({ err: error, agentId: agent.id }, "Failed to hydrate provider history");
       throw error;
+    }
+
+    // The replay is the timeline, so drop the rows a previous hydration committed.
+    // Keeping them would leave getTimelineRows reading one copy per hydration.
+    await this.deleteCommittedTimeline(agent.id);
+
+    const timelineEvents: Array<{
+      event: Extract<AgentStreamEvent, { type: "timeline" }>;
+      row: AgentTimelineRow;
+    }> = [];
+    const providerSubagentEvents: AgentManagerEvent[] = [];
+    for (const event of historySubagentEvents) {
+      const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
+      const managerEvent: AgentManagerEvent = { type: "provider_subagent", event: update };
+      if (deferredBroadcast) {
+        providerSubagentEvents.push(managerEvent);
+      } else if (broadcast) {
+        this.dispatch(managerEvent);
+      }
+    }
+    for (const event of historyEvents) {
+      const row = this.recordTimeline(
+        agent.id,
+        event.item,
+        event.timestamp ? { timestamp: event.timestamp } : undefined,
+      );
+      if (deferredBroadcast) {
+        timelineEvents.push({ event, row });
+      } else if (broadcast) {
+        this.dispatchStream(agent.id, event, {
+          seq: row.seq,
+          epoch: this.timelineStore.getEpoch(agent.id),
+          timestamp: row.timestamp,
+        });
+      }
     }
     agent.historyPrimed = true;
 
@@ -4330,6 +4804,7 @@ export class AgentManager {
     flags: StreamEventFlags;
   }): Promise<void> {
     const { agent, event, options, flags } = params;
+    event.item = stripContinuationPrefix(event.item, agent.config.continuationArchive);
 
     if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
       flags.shouldDispatchEvent = false;
@@ -4387,6 +4862,10 @@ export class AgentManager {
       "agent.manager.turn.completed",
     );
     if (terminalDisposition === "stale") return;
+    if (isForegroundEvent && agent.config.continuationPending) {
+      agent.config.continuationPending = false;
+      this.emitState(agent);
+    }
     if (event.usage) {
       agent.lastUsage = { ...agent.lastUsage, ...event.usage };
     }
@@ -4999,23 +5478,11 @@ export class AgentManager {
     // Always resolve cwd to absolute path for consistent history file lookup
     if (normalized.cwd) {
       normalized.cwd = resolve(normalized.cwd);
-      try {
-        const cwdStats = await stat(normalized.cwd);
-        if (!cwdStats.isDirectory()) {
-          throw new Error(`Working directory is not a directory: ${normalized.cwd}`);
-        }
-      } catch (error) {
-        if (
-          error instanceof Error &&
-          "code" in error &&
-          (error as NodeJS.ErrnoException).code === "ENOENT"
-        ) {
-          throw new Error(`Working directory does not exist: ${normalized.cwd}`, { cause: error });
-        }
-        if (error instanceof Error) {
-          throw error;
-        }
-        throw new Error(`Failed to access working directory: ${normalized.cwd}`, { cause: error });
+      // Only a session that will run in the directory needs it to still be there. Reading
+      // an archived agent's history runs nothing, and must survive the worktree it ran in
+      // being removed when its workspace was archived.
+      if (options.purpose !== "history") {
+        await assertUsableWorkingDirectory(normalized.cwd);
       }
     }
 
@@ -5088,9 +5555,12 @@ export class AgentManager {
   private async prepareSessionConfig(
     config: AgentSessionConfig,
     agentId: string,
-    env?: Record<string, string>,
+    options: { env?: Record<string, string>; purpose?: AgentResumePurpose } = {},
   ): Promise<PreparedSessionConfig> {
-    const storedConfig = await this.normalizeConfig(stripInternalPaseoMcpServer(config), { env });
+    const storedConfig = await this.normalizeConfig(stripInternalPaseoMcpServer(config), {
+      env: options.env,
+      purpose: options.purpose,
+    });
     const paseoToolPolicy = this.paseoToolsEnabled
       ? this.resolvePaseoToolPolicy(storedConfig.provider)
       : { enabled: false };
@@ -5258,6 +5728,10 @@ export class AgentManager {
   }
 
   private requireSessionAgent(id: string): ActiveManagedAgent {
+    if (this.switchingProviders.has(id))
+      throw new Error(
+        "Provider switch in progress. Wait for it to finish before sending messages or changing settings.",
+      );
     const agent = this.requireAgent(id);
     if (agent.session === null) {
       throw new Error(`Agent '${agent.id}' has no managed session`);
