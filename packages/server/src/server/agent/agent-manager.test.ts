@@ -11548,6 +11548,28 @@ test("conditional native admission cannot replace a user turn reserved before it
   }
 });
 
+test("conditional native admission refuses running lifecycle without active-turn bookkeeping", async () => {
+  const f = await conditionalFixture();
+  try {
+    const internals = f.manager as unknown as { agents: Map<string, ManagedAgent> };
+    const resident = internals.agents.get(f.agent.id)!;
+    resident.lifecycle = "running";
+    f.probe.release.resolve();
+    expect(f.manager.getAgent(f.agent.id)?.lifecycle).toBe("running");
+    expect(resident.activeTurnId).toBeNull();
+    expect(resident.activeForegroundTurnId).toBeNull();
+    expect(await f.manager.admitAgentMessage(f.input)).toEqual({
+      status: "rejected",
+      reason: "busy",
+    });
+    expect(f.probe.starts).toBe(0);
+    expect(f.probe.interruptions).toBe(0);
+    expect(f.probe.permissionResponses).toBe(0);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("conditional native admission reserves one turn and rejects a concurrent admission", async () => {
   const f = await conditionalFixture();
   try {
