@@ -3384,6 +3384,8 @@ export class CodexAppServerAgentSession implements AgentSession {
   private cachedRuntimeInfo: AgentRuntimeInfo | null = null;
   // Acknowledged request fields, not provider-reported effective configuration.
   private acceptedTurnRequest: Record<string, string | null> | null = null;
+  // Provider readback at thread start/resume; not a per-turn or account attestation.
+  private resolvedThreadConfiguration: Record<string, unknown> | null = null;
   private serviceTier: "fast" | null = null;
   private planModeEnabled = false;
   private historyPending = false;
@@ -3594,10 +3596,52 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   private rememberResolvedSandboxPolicy(response: unknown): void {
-    const sandbox = toObjectRecord(toObjectRecord(response)?.sandbox);
+    const record = toObjectRecord(response);
+    const thread = toObjectRecord(record?.thread);
+    const sandbox = toObjectRecord(record?.sandbox);
+    this.resolvedThreadConfiguration = null;
+    if (
+      typeof thread?.id === "string" &&
+      thread.id.trim() &&
+      typeof record?.model === "string" &&
+      record.model.trim()
+    ) {
+      const configuration: Record<string, unknown> = {
+        sessionId: thread.id,
+        model: record.model,
+      };
+      for (const key of [
+        "modelProvider",
+        "cwd",
+        "reasoningEffort",
+        "approvalPolicy",
+        "activePermissionProfile",
+      ]) {
+        const value = record[key];
+        if (typeof value === "string" || value === null) configuration[key] = value;
+      }
+      if (typeof sandbox?.type === "string") {
+        configuration.sandbox = this.projectResolvedSandbox(sandbox);
+      }
+      this.resolvedThreadConfiguration = configuration;
+    }
     this.resolvedSandboxPolicy = sandbox ?? null;
     if (sandbox?.type !== "workspaceWrite") return;
     this.resolvedWorkspaceWrite = readSandboxWorkspaceWrite(sandbox);
+  }
+
+  private projectResolvedSandbox(sandbox: Record<string, unknown>): Record<string, unknown> {
+    const policy: Record<string, unknown> = { type: sandbox.type };
+    if (
+      Array.isArray(sandbox.writableRoots) &&
+      sandbox.writableRoots.every((root) => typeof root === "string")
+    ) {
+      policy.writableRoots = [...sandbox.writableRoots];
+    }
+    for (const key of ["networkAccess", "excludeTmpdirEnvVar", "excludeSlashTmp"]) {
+      if (typeof sandbox[key] === "boolean") policy[key] = sandbox[key];
+    }
+    return policy;
   }
 
   private createClosedError(): Error {
@@ -4541,20 +4585,22 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   private withAcceptedTurnRequest(info: AgentRuntimeInfo): AgentRuntimeInfo {
+    const extra = { ...info.extra };
     if (
-      !this.acceptedTurnRequest ||
-      this.acceptedTurnRequest.sessionId !== this.currentThreadId ||
-      this.acceptedTurnRequest.sessionId !== info.sessionId
+      this.acceptedTurnRequest &&
+      this.acceptedTurnRequest.sessionId === this.currentThreadId &&
+      this.acceptedTurnRequest.sessionId === info.sessionId
     ) {
-      return { ...info };
+      extra.acceptedTurnRequest = { ...this.acceptedTurnRequest };
     }
-    return {
-      ...info,
-      extra: {
-        ...info.extra,
-        acceptedTurnRequest: { ...this.acceptedTurnRequest },
-      },
-    };
+    if (
+      this.resolvedThreadConfiguration &&
+      this.resolvedThreadConfiguration.sessionId === this.currentThreadId &&
+      this.resolvedThreadConfiguration.sessionId === info.sessionId
+    ) {
+      extra.resolvedThreadConfiguration = structuredClone(this.resolvedThreadConfiguration);
+    }
+    return { ...info, extra: Object.keys(extra).length ? extra : undefined };
   }
 
   async getAvailableModes(): Promise<AgentMode[]> {

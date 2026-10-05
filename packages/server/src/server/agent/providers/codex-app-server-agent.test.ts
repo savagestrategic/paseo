@@ -804,6 +804,124 @@ process.stdin.on("data", (chunk) => {
 }
 
 describe("Codex app-server provider", () => {
+  test("runtime info preserves provider-resolved thread configuration separately from requested settings", async () => {
+    const session = createSession({ model: "gpt-6-luna", thinkingOptionId: "medium" });
+    session.currentThreadId = null;
+    session.activeForegroundTurnId = null;
+    session.client = {
+      request: vi.fn(async (method: string) => {
+        if (method === "thread/start")
+          return {
+            thread: { id: "resolved-thread" },
+            model: "provider-resolved-model",
+            modelProvider: "openai",
+            cwd: "/tmp/codex-question-test",
+            reasoningEffort: "medium",
+            approvalPolicy: "on-request",
+            sandbox: {
+              type: "workspaceWrite",
+              writableRoots: ["/tmp/codex-question-test"],
+              networkAccess: false,
+              privateField: "must-not-publish",
+            },
+            activePermissionProfile: "owned-write-profile",
+            apiKey: "must-not-publish",
+          };
+        if (method === "turn/start") return { turn: { id: "resolved-native-turn" } };
+        throw new Error(`Unexpected request: ${method}`);
+      }),
+    };
+    await session.startTurn("repair");
+    const info = await session.getRuntimeInfo();
+    expect(info.model).toBe("gpt-6-luna");
+    expect(info.extra?.resolvedThreadConfiguration).toEqual({
+      sessionId: "resolved-thread",
+      model: "provider-resolved-model",
+      modelProvider: "openai",
+      cwd: "/tmp/codex-question-test",
+      reasoningEffort: "medium",
+      approvalPolicy: "on-request",
+      sandbox: {
+        type: "workspaceWrite",
+        writableRoots: ["/tmp/codex-question-test"],
+        networkAccess: false,
+      },
+      activePermissionProfile: "owned-write-profile",
+    });
+    const returned = info.extra?.resolvedThreadConfiguration as Record<string, unknown>;
+    (returned.sandbox as { writableRoots: string[] }).writableRoots.push("/unrelated");
+    await session.setModel!("gpt-6.1-sol");
+    expect((await session.getRuntimeInfo()).extra?.resolvedThreadConfiguration).toMatchObject({
+      model: "provider-resolved-model",
+      sandbox: { writableRoots: ["/tmp/codex-question-test"] },
+    });
+    session.currentThreadId = "replacement-thread";
+    expect((await session.getRuntimeInfo()).extra?.resolvedThreadConfiguration).toBeUndefined();
+  });
+
+  test.each([undefined, null, "", "   ", 42])(
+    "runtime info does not infer resolved model from requested settings (%s)",
+    async (model) => {
+      const session = createSession({ model: "gpt-6-luna", thinkingOptionId: "medium" });
+      session.activeForegroundTurnId = null;
+      session.client = {
+        request: vi.fn(async (method: string) => {
+          if (method === "thread/loaded/list") return { data: [] };
+          if (method === "thread/resume") return { thread: { id: "test-thread" }, model };
+          if (method === "turn/start") return { turn: { id: "native-turn" } };
+          throw new Error(`Unexpected request: ${method}`);
+        }),
+      };
+      await session.startTurn("repair");
+      const info = await session.getRuntimeInfo();
+      expect(info.model).toBe("gpt-6-luna");
+      expect(info.extra?.resolvedThreadConfiguration).toBeUndefined();
+      expect(info.extra?.acceptedTurnRequest).toMatchObject({ nativeTurnId: "native-turn" });
+    },
+  );
+
+  test("runtime info replaces resolved configuration on resume and clears incomplete readback", async () => {
+    const session = createSession({ model: "gpt-6-luna", thinkingOptionId: "medium" });
+    session.activeForegroundTurnId = null;
+    let resumeResponse: Record<string, unknown> = {
+      thread: { id: "test-thread" },
+      model: "gpt-6-luna",
+      reasoningEffort: "medium",
+      sandbox: { type: "readOnly", networkAccess: false },
+    };
+    session.client = {
+      request: vi.fn(async (method: string) => {
+        if (method === "thread/loaded/list") return { data: [] };
+        if (method === "thread/resume") return resumeResponse;
+        if (method === "turn/start") return { turn: { id: "native-turn" } };
+        throw new Error(`Unexpected request: ${method}`);
+      }),
+    };
+    await session.startTurn("repair");
+    expect((await session.getRuntimeInfo()).extra?.resolvedThreadConfiguration).toEqual({
+      sessionId: "test-thread",
+      model: "gpt-6-luna",
+      reasoningEffort: "medium",
+      sandbox: { type: "readOnly", networkAccess: false },
+    });
+    session.activeForegroundTurnId = null;
+    resumeResponse = {
+      thread: { id: "test-thread" },
+      model: "gpt-6.1-sol",
+      reasoningEffort: "high",
+    };
+    await session.startTurn("continue repair");
+    expect((await session.getRuntimeInfo()).extra?.resolvedThreadConfiguration).toEqual({
+      sessionId: "test-thread",
+      model: "gpt-6.1-sol",
+      reasoningEffort: "high",
+    });
+    session.activeForegroundTurnId = null;
+    resumeResponse = { thread: { id: "test-thread" } };
+    await session.startTurn("continue repair");
+    expect((await session.getRuntimeInfo()).extra?.resolvedThreadConfiguration).toBeUndefined();
+  });
+
   test("runtime info binds acknowledged turn settings without following later configuration", async () => {
     const session = createSession({ model: "gpt-6-luna", thinkingOptionId: "medium" });
     session.activeForegroundTurnId = null;
