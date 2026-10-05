@@ -3382,6 +3382,8 @@ export class CodexAppServerAgentSession implements AgentSession {
   private activeForegroundTurnId: string | null = null;
   private activeClientMessageId: string | null = null;
   private cachedRuntimeInfo: AgentRuntimeInfo | null = null;
+  // Acknowledged request fields, not provider-reported effective configuration.
+  private acceptedTurnRequest: Record<string, string | null> | null = null;
   private serviceTier: "fast" | null = null;
   private planModeEnabled = false;
   private historyPending = false;
@@ -4257,6 +4259,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       cancelRequested: false,
     };
     this.pendingForegroundStart = pendingStart;
+    this.acceptedTurnRequest = null;
 
     this.dismissPendingPlanApprovals("Dismissed by a new prompt");
 
@@ -4305,7 +4308,15 @@ export class CodexAppServerAgentSession implements AgentSession {
       if (pendingStart.cancelRequested) {
         throw new Error("Codex turn start was interrupted before reaching Codex");
       }
-      await this.client.request("turn/start", turnStart.params, TURN_START_TIMEOUT_MS);
+      const requestEvidence = this.buildTurnRequestEvidence({
+        params: turnStart.params,
+        turnId,
+        clientMessageId: options?.clientMessageId ?? null,
+      });
+      const response = toObjectRecord(
+        await this.client.request("turn/start", turnStart.params, TURN_START_TIMEOUT_MS),
+      );
+      this.rememberAcceptedTurnRequest({ response, requestEvidence });
       return { turnId };
     } catch (error) {
       this.pendingForegroundTurnIdentification?.resolve(null);
@@ -4318,6 +4329,46 @@ export class CodexAppServerAgentSession implements AgentSession {
         this.pendingForegroundStart = null;
       }
       pendingStart.resolve();
+    }
+  }
+
+  private buildTurnRequestEvidence({
+    params,
+    turnId,
+    clientMessageId,
+  }: {
+    params: Record<string, unknown>;
+    turnId: string;
+    clientMessageId: string | null;
+  }): Record<string, string | null> {
+    const evidence: Record<string, string | null> = {
+      sessionId: typeof params.threadId === "string" ? params.threadId : null,
+      turnId,
+      clientMessageId,
+      model: typeof params.model === "string" ? params.model : null,
+      thinkingOptionId: typeof params.effort === "string" ? params.effort : null,
+      modeId: this.currentMode ?? null,
+    };
+    const collaboration = toObjectRecord(params.collaborationMode);
+    const settings = toObjectRecord(collaboration?.settings);
+    if (settings) {
+      evidence.collaborationModel = typeof settings.model === "string" ? settings.model : null;
+      evidence.collaborationThinkingOptionId =
+        typeof settings.reasoning_effort === "string" ? settings.reasoning_effort : null;
+    }
+    return evidence;
+  }
+
+  private rememberAcceptedTurnRequest({
+    response,
+    requestEvidence,
+  }: {
+    response: Record<string, unknown> | undefined;
+    requestEvidence: Record<string, string | null>;
+  }): void {
+    const nativeTurn = toObjectRecord(response?.turn);
+    if (typeof nativeTurn?.id === "string" && nativeTurn.id.trim()) {
+      this.acceptedTurnRequest = { ...requestEvidence, nativeTurnId: nativeTurn.id };
     }
   }
 
@@ -4468,7 +4519,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   async getRuntimeInfo(): Promise<AgentRuntimeInfo> {
-    if (this.cachedRuntimeInfo) return { ...this.cachedRuntimeInfo };
+    if (this.cachedRuntimeInfo) return this.withAcceptedTurnRequest(this.cachedRuntimeInfo);
     if (this.connectionState === "disconnected") {
       await this.connect();
     }
@@ -4486,7 +4537,24 @@ export class CodexAppServerAgentSession implements AgentSession {
         : undefined,
     };
     this.cachedRuntimeInfo = info;
-    return { ...info };
+    return this.withAcceptedTurnRequest(info);
+  }
+
+  private withAcceptedTurnRequest(info: AgentRuntimeInfo): AgentRuntimeInfo {
+    if (
+      !this.acceptedTurnRequest ||
+      this.acceptedTurnRequest.sessionId !== this.currentThreadId ||
+      this.acceptedTurnRequest.sessionId !== info.sessionId
+    ) {
+      return { ...info };
+    }
+    return {
+      ...info,
+      extra: {
+        ...info.extra,
+        acceptedTurnRequest: { ...this.acceptedTurnRequest },
+      },
+    };
   }
 
   async getAvailableModes(): Promise<AgentMode[]> {

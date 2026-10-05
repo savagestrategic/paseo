@@ -804,6 +804,100 @@ process.stdin.on("data", (chunk) => {
 }
 
 describe("Codex app-server provider", () => {
+  test("runtime info binds acknowledged turn settings without following later configuration", async () => {
+    const session = createSession({ model: "gpt-6-luna", thinkingOptionId: "medium" });
+    session.activeForegroundTurnId = null;
+    session.client = {
+      request: vi.fn(async (method: string) => {
+        if (method === "thread/loaded/list") return { data: ["test-thread"] };
+        if (method === "turn/start") return { turn: { id: "native-accepted-turn" } };
+        throw new Error(`Unexpected request: ${method}`);
+      }),
+    };
+    const accepted = await session.startTurn("repair the owned PR", {
+      clientMessageId: "bootstrap-1",
+    });
+    await session.setModel!("gpt-6.1-sol");
+    const info = await session.getRuntimeInfo();
+    expect(info.model).toBe("gpt-6.1-sol");
+    expect(info.extra?.acceptedTurnRequest).toEqual({
+      sessionId: "test-thread",
+      turnId: accepted.turnId,
+      nativeTurnId: "native-accepted-turn",
+      clientMessageId: "bootstrap-1",
+      model: "gpt-6-luna",
+      thinkingOptionId: "medium",
+      modeId: "auto",
+    });
+    const returnedEvidence = info.extra?.acceptedTurnRequest as Record<string, unknown>;
+    returnedEvidence.model = "tampered-model";
+    expect((await session.getRuntimeInfo()).extra?.acceptedTurnRequest).toMatchObject({
+      model: "gpt-6-luna",
+    });
+    session.currentThreadId = "replaced-thread";
+    expect((await session.getRuntimeInfo()).extra?.acceptedTurnRequest).toBeUndefined();
+    session.currentThreadId = "test-thread";
+    session.activeForegroundTurnId = null;
+    session.client.request = vi.fn(async (method: string) => {
+      if (method === "thread/loaded/list") return { data: ["test-thread"] };
+      throw new Error("rejected turn");
+    });
+    await expect(session.startTurn("second repair")).rejects.toThrow("rejected turn");
+    expect((await session.getRuntimeInfo()).extra?.acceptedTurnRequest).toBeUndefined();
+  });
+
+  test("runtime evidence snapshots the submitted settings across an in-flight model change", async () => {
+    const session = createSession({ model: "gpt-6-luna", thinkingOptionId: "medium" });
+    session.activeForegroundTurnId = null;
+    let accept!: (value: unknown) => void;
+    let started!: () => void;
+    const pending = new Promise<unknown>((resolve) => {
+      accept = resolve;
+    });
+    const submitted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    session.client = {
+      request: vi.fn(async (method: string) => {
+        if (method === "thread/loaded/list") return { data: ["test-thread"] };
+        if (method === "turn/start") {
+          started();
+          return pending;
+        }
+        throw new Error(`Unexpected request: ${method}`);
+      }),
+    };
+    const run = session.startTurn("repair");
+    await submitted;
+    expect((await session.getRuntimeInfo()).extra?.acceptedTurnRequest).toBeUndefined();
+    await session.setModel!("gpt-6.1-sol");
+    accept({ turn: { id: "accepted-before-escalation" } });
+    const accepted = await run;
+    expect((await session.getRuntimeInfo()).extra?.acceptedTurnRequest).toMatchObject({
+      turnId: accepted.turnId,
+      nativeTurnId: "accepted-before-escalation",
+      model: "gpt-6-luna",
+      thinkingOptionId: "medium",
+    });
+  });
+
+  test.each([{}, { turn: { id: "" } }, { turn: { id: "  " } }, { turn: { id: 12 } }])(
+    "runtime info does not invent native accepted-turn evidence for response %j",
+    async (response) => {
+      const session = createSession({ model: "gpt-6-luna", thinkingOptionId: "medium" });
+      session.activeForegroundTurnId = null;
+      session.client = {
+        request: vi.fn(async (method: string) => {
+          if (method === "thread/loaded/list") return { data: ["test-thread"] };
+          if (method === "turn/start") return response;
+          throw new Error(`Unexpected request: ${method}`);
+        }),
+      };
+      await session.startTurn("repair");
+      expect((await session.getRuntimeInfo()).extra?.acceptedTurnRequest).toBeUndefined();
+    },
+  );
+
   test("getAvailableModes includes auto-review when the Codex version supports it", async () => {
     const session = createSession({}, { autoReviewEnabled: true });
 
