@@ -1,3 +1,7 @@
+import type {
+  AdmitAgentMessageRequest,
+  AgentMessageAdmissionResult,
+} from "@getpaseo/protocol/messages";
 import { subscribeTimeline, type TimelineMessage } from "./timeline-subscription/index.js";
 import { ProviderSnapshotUpdates } from "./provider-snapshots/index.js";
 import {
@@ -3419,6 +3423,30 @@ export class DaemonClient {
   // ============================================================================
   // Agent Interaction
   // ============================================================================
+
+  async admitAgentMessage(
+    input: Omit<AdmitAgentMessageRequest, "type" | "requestId">,
+  ): Promise<AgentMessageAdmissionResult> {
+    if (this.getLastServerInfoMessage()?.features?.conditionalAgentMessages !== true) {
+      throw new Error("Host does not support conditional agent message admission; update the host");
+    }
+    const requestId = this.createRequestId();
+    const message = SessionInboundMessageSchema.parse({
+      ...input,
+      type: "agent.message.admit.request",
+      requestId,
+    });
+    const payload = await this.sendRequest({
+      requestId,
+      message,
+      options: { skipQueue: true },
+      select: (msg) =>
+        msg.type === "agent.message.admit.response" && msg.payload.requestId === requestId
+          ? msg.payload
+          : null,
+    });
+    return payload.result;
+  }
 
   async sendAgentMessage(
     agentId: string,
