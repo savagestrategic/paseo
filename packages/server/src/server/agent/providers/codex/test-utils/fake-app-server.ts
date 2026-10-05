@@ -140,6 +140,7 @@ export function createFakeCodexAppServer(
     initialize: () => ({}),
     "collaborationMode/list": () => ({ data: [] }),
     "config/read": () => ({ config: {} }),
+    "account/read": () => ({ account: null }),
     getUserSavedConfig: () => ({ config: {} }),
     "model/list": () => ({
       data: [

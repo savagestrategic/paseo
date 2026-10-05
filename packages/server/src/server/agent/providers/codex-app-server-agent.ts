@@ -43,7 +43,7 @@ import { runProviderRefreshActivity } from "../provider-refresh-deadline.js";
 import type { Logger } from "pino";
 
 import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -3386,6 +3386,8 @@ export class CodexAppServerAgentSession implements AgentSession {
   private acceptedTurnRequest: Record<string, string | null> | null = null;
   // Provider readback at thread start/resume; not a per-turn or account attestation.
   private resolvedThreadConfiguration: Record<string, unknown> | null = null;
+  private runtimeAccountObservation: Record<string, unknown> | null = null;
+  private runtimeAccountClient: CodexAppServerClientLike | null = null;
   private serviceTier: "fast" | null = null;
   private planModeEnabled = false;
   private historyPending = false;
@@ -3592,6 +3594,54 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.resolvedWorkspaceWrite = readSandboxWorkspaceWrite(config?.sandbox_workspace_write);
     } catch (error) {
       this.logger.debug({ error }, "Failed to read resolved Codex workspace-write config");
+    }
+  }
+
+  private async observeRuntimeAccount(): Promise<void> {
+    // Read only this session's maintained connection. Missing evidence never
+    // inherits account identity from environment or another App Server process.
+    this.runtimeAccountObservation = null;
+    this.runtimeAccountClient = null;
+    const client = this.client;
+    if (!client) return;
+    try {
+      const accountResponse = toObjectRecord(await client.request("account/read", {}, 1_000));
+      const configResponse = toObjectRecord(
+        await client.request("config/read", { cwd: this.config.cwd ?? null }, 1_000),
+      );
+      const account = toObjectRecord(accountResponse?.account);
+      const config = toObjectRecord(configResponse?.config);
+      if (
+        client !== this.client ||
+        this.closed ||
+        !config ||
+        typeof account?.type !== "string" ||
+        !account.type.trim() ||
+        typeof account.email !== "string" ||
+        !account.email.trim()
+      )
+        return;
+      // Match the canonical Codex account normalizer's sorted JSON identity.
+      const principal = { email: account.email.trim().toLowerCase(), type: account.type.trim() };
+      const workspace =
+        typeof config.forced_chatgpt_workspace_id === "string"
+          ? config.forced_chatgpt_workspace_id.trim()
+          : "";
+      this.runtimeAccountClient = client;
+      this.runtimeAccountObservation = {
+        observedAt: new Date().toISOString(),
+        source: "native-session-app-server",
+        principalFingerprint: createHash("sha256").update(JSON.stringify(principal)).digest("hex"),
+        workspaceFingerprint: workspace
+          ? createHash("sha256")
+              .update(JSON.stringify({ workspace_id: workspace }))
+              .digest("hex")
+          : null,
+        workspaceIdentityStatus: workspace ? "VERIFIED" : "UNAVAILABLE",
+        accountType: principal.type,
+      };
+    } catch {
+      this.logger.debug("Native Codex account readback unavailable");
     }
   }
 
@@ -4304,6 +4354,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     };
     this.pendingForegroundStart = pendingStart;
     this.acceptedTurnRequest = null;
+    this.runtimeAccountObservation = null;
 
     this.dismissPendingPlanApprovals("Dismissed by a new prompt");
 
@@ -4324,6 +4375,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         await this.ensureThread();
       }
 
+      await this.observeRuntimeAccount();
       const turnStart = await this.buildTurnStartParams(effectivePrompt, options);
       const turnId = this.createTurnId();
       this.activeForegroundTurnId = turnId;
@@ -4592,6 +4644,13 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.acceptedTurnRequest.sessionId === info.sessionId
     ) {
       extra.acceptedTurnRequest = { ...this.acceptedTurnRequest };
+      if (this.runtimeAccountObservation && this.runtimeAccountClient === this.client) {
+        extra.runtimeAccountObservation = {
+          ...this.runtimeAccountObservation,
+          sessionId: this.acceptedTurnRequest.sessionId,
+          nativeTurnId: this.acceptedTurnRequest.nativeTurnId,
+        };
+      }
     }
     if (
       this.resolvedThreadConfiguration &&
