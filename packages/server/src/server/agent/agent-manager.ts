@@ -2546,6 +2546,12 @@ export class AgentManager {
       if (pendingRun.settled) {
         throw new Error(`Agent ${agentId} run was canceled before its turn started`);
       }
+      // Capture the provider's acknowledgment before publishing the accepted
+      // foreground boundary; completion can be much later than admission.
+      await this.refreshRuntimeInfo(agent, { emit: false });
+      if (pendingRun.settled) {
+        throw new Error(`Agent ${agentId} run was canceled before its turn started`);
+      }
       return result.turnId;
     } catch (error) {
       if (pendingRun.settled) {

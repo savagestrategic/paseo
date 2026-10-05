@@ -660,6 +660,7 @@ async function startAndSteerThroughManager(
     activeTurnBehavior: behavior,
     runOptions: { clientMessageId: "replacement-client" },
   });
+  await manager.waitForAgentRunStart(agent.id);
   return { manager, agentId: agent.id, workdir };
 }
 
@@ -1086,6 +1087,7 @@ test("orders a concurrent replacement after a pending accepted steer", async () 
     })();
     await consumeInitial;
     await vi.waitFor(() => expect(session.startCount).toBe(2));
+    await manager.waitForAgentRunStart(agent.id);
 
     expect(session.interruptCount).toBe(1);
     expect(
@@ -6300,6 +6302,54 @@ test("createAgent populates runtimeInfo after session creation", async () => {
   expect(snapshot.runtimeInfo).toBeDefined();
   expect(snapshot.runtimeInfo?.model).toBe("gpt-5.2-codex");
   expect(snapshot.runtimeInfo?.sessionId).toBe(snapshot.persistence?.sessionId);
+});
+
+test("accepted foreground turn publishes runtime evidence before completion", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-accepted-runtime-"));
+  class AcceptedRuntimeSession extends TestAgentSession {
+    private accepted = false;
+    override async startTurn(): Promise<{ turnId: string }> {
+      this.accepted = true;
+      return { turnId: "accepted-runtime-turn" };
+    }
+    override async getRuntimeInfo() {
+      const info = await super.getRuntimeInfo();
+      return {
+        ...info,
+        extra: this.accepted
+          ? { acceptedTurnRequest: { nativeTurnId: "provider-turn" } }
+          : undefined,
+      };
+    }
+  }
+  const session = new AcceptedRuntimeSession({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: new AgentStorage(join(workdir, "agents"), logger),
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000105",
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  const stream = manager.streamAgent(agent.id, "bootstrap");
+  try {
+    const first = await stream.next();
+    expect(first.value).toMatchObject({ type: "turn_started", turnId: "accepted-runtime-turn" });
+    expect(manager.getAgent(agent.id)?.runtimeInfo?.extra?.acceptedTurnRequest).toEqual({
+      nativeTurnId: "provider-turn",
+    });
+    expect(manager.getAgent(agent.id)?.lifecycle).toBe("running");
+  } finally {
+    await stream.return();
+    await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 test("runAgent refreshes runtimeInfo after completion", async () => {
