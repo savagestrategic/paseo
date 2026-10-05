@@ -674,6 +674,9 @@ export interface AgentSession {
   subscribe(callback: (event: AgentStreamEvent) => void): () => void;
   streamHistory(): AsyncGenerator<AgentStreamEvent>;
   getRuntimeInfo(): Promise<AgentRuntimeInfo>;
+  /** Read fresh evidence on an existing native connection without creating a
+   * session, starting a turn, or changing pending permissions. */
+  refreshRuntimeInfo?(): Promise<AgentRuntimeInfo>;
   getAvailableModes(): Promise<AgentMode[]>;
   getCurrentMode(): Promise<string | null>;
   setMode(modeId: string): Promise<void | AgentProviderNotice>;

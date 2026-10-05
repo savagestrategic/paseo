@@ -922,6 +922,63 @@ describe("Codex app-server provider", () => {
     expect((await session.getRuntimeInfo()).extra?.resolvedThreadConfiguration).toBeUndefined();
   });
 
+  test("runtime refresh only reads the maintained connection for an acknowledged turn", async () => {
+    const session = createSession();
+    session.activeForegroundTurnId = null;
+    const request = vi.fn(async (method: string) => {
+      if (method === "thread/loaded/list") return { data: ["test-thread"] };
+      if (method === "turn/start") return { turn: { id: "refresh-native-turn" } };
+      if (method === "account/read") return { account: null };
+      if (method === "config/read") return { config: {} };
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    session.client = { request };
+    await session.startTurn("owned bootstrap");
+    const before = await session.getRuntimeInfo();
+    request.mockClear();
+    const refreshed = await session.refreshRuntimeInfo!();
+    expect(request.mock.calls.map(([method]) => method)).toEqual(["account/read", "config/read"]);
+    expect(refreshed.extra?.acceptedTurnRequest).toEqual(before.extra?.acceptedTurnRequest);
+    expect(session.currentThreadId).toBe("test-thread");
+  });
+
+  test("runtime refresh rejects an unacknowledged session without native requests", async () => {
+    const session = createSession();
+    const request = vi.fn(async () => ({}));
+    session.client = { request };
+    await expect(session.refreshRuntimeInfo!()).rejects.toThrow(
+      "Native runtime refresh unavailable",
+    );
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  test.each(["session", "connection"])(
+    "runtime refresh rejects %s replacement during the native read",
+    async (replacement) => {
+      const session = createSession();
+      session.activeForegroundTurnId = null;
+      session.client = {
+        request: vi.fn(async (method: string) => {
+          if (method === "thread/loaded/list") return { data: ["test-thread"] };
+          if (method === "turn/start") return { turn: { id: "refresh-native-turn" } };
+          if (method === "account/read") return { account: null };
+          if (method === "config/read") return { config: {} };
+          throw new Error(`Unexpected request: ${method}`);
+        }),
+      };
+      await session.startTurn("owned bootstrap");
+      await session.getRuntimeInfo();
+      session.client.request = vi.fn(async () => {
+        if (replacement === "session") session.currentThreadId = "replacement-thread";
+        else session.client = null;
+        return {};
+      });
+      await expect(session.refreshRuntimeInfo!()).rejects.toThrow(
+        "Native runtime changed during refresh",
+      );
+    },
+  );
+
   test("runtime info binds acknowledged turn settings without following later configuration", async () => {
     const session = createSession({ model: "gpt-6-luna", thinkingOptionId: "medium" });
     session.activeForegroundTurnId = null;

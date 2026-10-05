@@ -3603,6 +3603,8 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.runtimeAccountObservation = null;
     this.runtimeAccountClient = null;
     const client = this.client;
+    const threadId = this.currentThreadId;
+    const acceptedRequest = this.acceptedTurnRequest;
     if (!client) return;
     try {
       const accountResponse = toObjectRecord(await client.request("account/read", {}, 1_000));
@@ -3613,6 +3615,8 @@ export class CodexAppServerAgentSession implements AgentSession {
       const config = toObjectRecord(configResponse?.config);
       if (
         client !== this.client ||
+        threadId !== this.currentThreadId ||
+        acceptedRequest !== this.acceptedTurnRequest ||
         this.closed ||
         !config ||
         typeof account?.type !== "string" ||
@@ -4612,6 +4616,36 @@ export class CodexAppServerAgentSession implements AgentSession {
         timestamp: entry.timestamp,
       };
     }
+  }
+
+  async refreshRuntimeInfo(): Promise<AgentRuntimeInfo> {
+    const client = this.client;
+    const threadId = this.currentThreadId;
+    const acceptedRequest = this.acceptedTurnRequest;
+    if (
+      this.closed ||
+      this.connectionState !== "connected" ||
+      !client ||
+      !threadId ||
+      !this.cachedRuntimeInfo ||
+      this.cachedRuntimeInfo.sessionId !== threadId ||
+      !acceptedRequest ||
+      acceptedRequest.sessionId !== threadId
+    ) {
+      throw new Error("Native runtime refresh unavailable");
+    }
+    // Never call connect(), ensureThread(), or startTurn() from this read path.
+    await this.observeRuntimeAccount();
+    if (
+      this.closed ||
+      client !== this.client ||
+      threadId !== this.currentThreadId ||
+      acceptedRequest !== this.acceptedTurnRequest ||
+      this.cachedRuntimeInfo?.sessionId !== threadId
+    ) {
+      throw new Error("Native runtime changed during refresh");
+    }
+    return this.withAcceptedTurnRequest(this.cachedRuntimeInfo);
   }
 
   async getRuntimeInfo(): Promise<AgentRuntimeInfo> {
