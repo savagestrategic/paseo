@@ -727,6 +727,17 @@ function detachedAgentLabelPatch(labels: Record<string, string>): AgentLabelPatc
   return patch;
 }
 
+export interface AgentReloadOptions {
+  rehydrateFromDisk?: boolean;
+  /** Internal admission seam; callers must persist an operation receipt before use. */
+  admission?: {
+    expected: AdmitAgentMessageRequest["expected"];
+    expectedNativeTurnId: string;
+    expiresAt: string;
+    authorize: () => boolean;
+  };
+}
+
 export class AgentManager {
   private readonly pluginLifecycle: PluginLifecycle | undefined;
   private readonly clients = new Map<AgentProvider, AgentClient>();
@@ -1545,15 +1556,27 @@ export class AgentManager {
   reloadAgentSession(
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
-    options?: { rehydrateFromDisk?: boolean },
+    options?: AgentReloadOptions,
   ): Promise<ManagedAgent> {
+    // Capture custody and configuration at the call boundary, before waiting
+    // for the lifecycle lane. The authority callback remains live.
+    const capturedOptions = options?.admission
+      ? {
+          ...options,
+          admission: {
+            ...options.admission,
+            expected: structuredClone(options.admission.expected),
+          },
+        }
+      : options;
+    const capturedOverrides = options?.admission ? structuredClone(overrides) : overrides;
     return this.trackAgentRegistrationOperation(
       this.runLifecycleMutation(agentId, async () => {
         // Foreground starts do not acquire the lifecycle lane. Reserve the
         // resident writer before preparation or close can yield to a start.
         this.reloadingAgents.add(agentId);
         try {
-          return await this.reloadAgentSessionInternal(agentId, overrides, options);
+          return await this.reloadAgentSessionInternal(agentId, capturedOverrides, capturedOptions);
         } finally {
           this.reloadingAgents.delete(agentId);
         }
@@ -1564,10 +1587,12 @@ export class AgentManager {
   private async reloadAgentSessionInternal(
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
-    options?: { rehydrateFromDisk?: boolean },
+    options?: AgentReloadOptions,
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     let existing = this.requireSessionAgent(agentId);
+    await this.prepareReloadAdmission(agentId, options);
+    this.assertReloadAdmission(existing, options);
     if (this.hasInFlightRun(agentId)) {
       await this.cancelAgentRunBefore(agentId, "reload");
       existing = this.requireSessionAgent(agentId);
@@ -1610,6 +1635,9 @@ export class AgentManager {
     let session: AgentSession | undefined;
     let closedExisting: ManagedAgentClosed | undefined;
     let handedToRegistration = false;
+    await this.prepareReloadAdmission(agentId, options);
+    // This is the final synchronous custody check before closing the writer.
+    this.assertReloadAdmission(existing, options);
     try {
       // A persisted thread can have only one writer, even when its turn is idle.
       await this.closeReloadedSession(existing.session, agentId);
@@ -1619,12 +1647,17 @@ export class AgentManager {
       await this.persistSnapshot(closedExisting);
       this.assertAcceptingAgentRegistrations();
 
+      // Revocation during close must leave the saved session closed, rather
+      // than opening a new writer under an expired authority.
+      this.assertReloadAuthority(options);
+
       this.paseoToolPolicies.set(agentId, paseoToolPolicy);
       session = handle
         ? await client.resumeSession(handle, providerLaunchConfig, launchContext)
         : await client.createSession(providerLaunchConfig, launchContext);
       await this.requireExternalMcpSupport(session, storedConfig);
       this.assertAcceptingAgentRegistrations();
+      this.assertReloadResumedSession(session, options);
 
       if (rehydrateFromDisk) {
         // Wipe the in-memory timeline so registerSession mints a new epoch and
@@ -1671,6 +1704,76 @@ export class AgentManager {
         }
       }
     }
+  }
+
+  private async prepareReloadAdmission(
+    agentId: string,
+    options?: AgentReloadOptions,
+  ): Promise<void> {
+    if (!options?.admission) return;
+    const record = await this.requireRegistry().get(agentId);
+    if (!record) throw new Error("Reload admission: not_found");
+    if (record.archivedAt) throw new Error("Reload admission: archived");
+    await this.drainSessionEvents(agentId);
+    this.agentStreamCoalescer.flushFor(agentId);
+  }
+
+  private assertReloadResumedSession(session: AgentSession, options?: AgentReloadOptions): void {
+    const admission = options?.admission;
+    if (!admission) return;
+    this.assertReloadAuthority(options);
+    const resumed = session.describePersistence();
+    if (
+      resumed?.provider !== admission.expected.provider ||
+      resumed.sessionId !== admission.expected.sessionId
+    ) {
+      throw new Error("Reload admission: resumed identity changed");
+    }
+  }
+
+  private assertReloadAuthority(options?: AgentReloadOptions): void {
+    const admission = options?.admission;
+    if (!admission) return;
+    const deadline = Date.parse(admission.expiresAt);
+    if (!Number.isFinite(deadline) || deadline <= Date.now())
+      throw new Error("Reload admission: expired");
+    if (!admission.authorize()) throw new Error("Reload admission: not_authorized");
+  }
+
+  private assertReloadAdmission(agent: ActiveManagedAgent, options?: AgentReloadOptions): void {
+    const admission = options?.admission;
+    if (!admission) return;
+    if (options.rehydrateFromDisk) throw new Error("Reload admission cannot replace history");
+    if (this.agents.get(agent.id) !== agent || agent.lifecycle !== "idle")
+      throw new Error("Reload admission: not_idle");
+    if (agent.pendingPermissions.size || agent.inFlightPermissionResponses.size)
+      throw new Error("Reload admission: permission_pending");
+    if (this.hasInFlightRun(agent.id) || agent.activeTurnId || agent.pendingReplacement)
+      throw new Error("Reload admission: busy");
+    if (
+      !this.matchesMessageAdmissionScope(agent, admission.expected) ||
+      !this.matchesReloadNativeTurn(agent, admission)
+    ) {
+      throw new Error("Reload admission: scope_changed");
+    }
+    this.assertReloadAuthority(options);
+  }
+
+  private matchesReloadNativeTurn(
+    agent: ActiveManagedAgent,
+    admission: NonNullable<AgentReloadOptions["admission"]>,
+  ): boolean {
+    const accepted = agent.runtimeInfo?.extra?.acceptedTurnRequest;
+    return (
+      agent.runtimeInfo?.sessionId === admission.expected.sessionId &&
+      !!accepted &&
+      typeof accepted === "object" &&
+      "sessionId" in accepted &&
+      accepted.sessionId === admission.expected.sessionId &&
+      "nativeTurnId" in accepted &&
+      !!admission.expectedNativeTurnId &&
+      accepted.nativeTurnId === admission.expectedNativeTurnId
+    );
   }
 
   private async closeReloadedSession(session: AgentSession, agentId: string): Promise<void> {

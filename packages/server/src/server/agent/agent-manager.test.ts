@@ -11581,6 +11581,173 @@ function conditionalExpectation(agent: ManagedAgent) {
   };
 }
 
+async function guardedReloadFixture() {
+  const workdir = mkdtempSync(join(tmpdir(), "guarded-reload-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const closeStarted = deferred<void>();
+  const closeAllowed = deferred<void>();
+  let closes = 0;
+  let replacementClosed = false;
+  class GuardedSession extends TestAgentSession {
+    override readonly id: string;
+    constructor(config: AgentSessionConfig, nativeId = randomUUID()) {
+      super(config);
+      this.id = nativeId;
+    }
+    override async getRuntimeInfo() {
+      return {
+        ...(await super.getRuntimeInfo()),
+        extra: { acceptedTurnRequest: { sessionId: this.id, nativeTurnId: "owned-native-turn" } },
+      };
+    }
+  }
+  const client = new (class extends TestAgentClient {
+    changeResumeIdentity = false;
+    override async createSession(config: AgentSessionConfig) {
+      return new (class extends GuardedSession {
+        override async close() {
+          closes++;
+          closeStarted.resolve();
+          await closeAllowed.promise;
+        }
+      })(config);
+    }
+    override async resumeSession(
+      handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ) {
+      this.resumeOverrides.push(config);
+      return new (class extends GuardedSession {
+        override async close() {
+          replacementClosed = true;
+        }
+      })(
+        { ...config, provider: "codex", cwd: workdir },
+        this.changeResumeIdentity ? randomUUID() : handle.sessionId,
+      );
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const agent = await manager.createAgent(
+    { provider: "codex", cwd: workdir, model: "gpt-6-luna", thinkingOptionId: "medium" },
+    undefined,
+    { workspaceId: undefined },
+  );
+  const admission = {
+    expected: conditionalExpectation(agent),
+    expectedNativeTurnId: "owned-native-turn",
+    expiresAt: new Date(Date.now() + 60000).toISOString(),
+    authorize: () => true,
+  };
+  return {
+    manager,
+    agent,
+    admission,
+    client,
+    storage,
+    closeStarted,
+    closeAllowed,
+    effects: () => ({ closes, resumes: client.resumeOverrides.length, replacementClosed }),
+    async cleanup() {
+      closeAllowed.resolve();
+      await manager.closeAgent(agent.id);
+      await storage.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    },
+  };
+}
+
+test.each(["scope", "turn", "expired", "authority", "late_authority", "history"])(
+  "guarded reload refuses %s before closing the writer",
+  async (scenario) => {
+    const f = await guardedReloadFixture();
+    try {
+      const admission = { ...f.admission, expected: { ...f.admission.expected } };
+      if (scenario === "scope") admission.expected.cwd += "-wrong";
+      if (scenario === "turn") admission.expectedNativeTurnId = "unowned-turn";
+      if (scenario === "expired") admission.expiresAt = "2000-01-01T00:00:00Z";
+      if (scenario === "authority") admission.authorize = () => false;
+      let checks = 0;
+      if (scenario === "late_authority") admission.authorize = () => ++checks < 2;
+      await expect(
+        f.manager.reloadAgentSession(
+          f.agent.id,
+          { model: "gpt-6.1-sol" },
+          {
+            admission,
+            rehydrateFromDisk: scenario === "history",
+          },
+        ),
+      ).rejects.toThrow(/Reload admission/);
+      expect(f.effects()).toEqual({ closes: 0, resumes: 0, replacementClosed: false });
+      expect(f.manager.getAgent(f.agent.id)?.lifecycle).toBe("idle");
+      expect(f.manager.getAgent(f.agent.id)?.config.model).toBe("gpt-6-luna");
+    } finally {
+      await f.cleanup();
+    }
+  },
+);
+
+test.each(["stable", "revoked", "identity"])(
+  "guarded reload preserves native custody through %s close",
+  async (scenario) => {
+    const f = await guardedReloadFixture();
+    let authorized = true;
+    f.admission.authorize = () => authorized;
+    f.client.changeResumeIdentity = scenario === "identity";
+    const reloading = f.manager.reloadAgentSession(
+      f.agent.id,
+      {
+        model: "gpt-6.1-sol",
+        thinkingOptionId: "medium",
+      },
+      { admission: f.admission },
+    );
+    // Attach a rejection observer before deliberately revoking admission.
+    const outcome = reloading.then(
+      (agent) => ({ agent }),
+      (error: unknown) => ({ error }),
+    );
+    try {
+      await Promise.race([
+        f.closeStarted.promise,
+        outcome.then((result) => {
+          if ("error" in result) throw result.error;
+          throw new Error("Reload returned before close");
+        }),
+      ]);
+      expect(() => f.manager.streamAgent(f.agent.id, "Racing turn")).toThrow("being reloaded");
+      if (scenario === "revoked") authorized = false;
+      f.closeAllowed.resolve();
+      const result = await outcome;
+      if (scenario === "stable") {
+        expect("agent" in result).toBe(true);
+        const current = f.manager.getAgent(f.agent.id)!;
+        expect(current.persistence?.sessionId).toBe(f.agent.persistence?.sessionId);
+        expect(current.labels).toEqual(f.agent.labels);
+        expect(current.lastUsage).toEqual(f.agent.lastUsage);
+        expect(f.client.resumeOverrides[0]).toMatchObject({
+          model: "gpt-6.1-sol",
+          thinkingOptionId: "medium",
+        });
+      } else {
+        expect("error" in result).toBe(true);
+        expect(f.manager.getAgent(f.agent.id)).toBeNull();
+        expect((await f.storage.get(f.agent.id))?.lastStatus).toBe("closed");
+      }
+      expect(f.effects()).toEqual({
+        closes: 1,
+        resumes: scenario === "revoked" ? 0 : 1,
+        replacementClosed: scenario === "identity",
+      });
+    } finally {
+      f.closeAllowed.resolve();
+      await outcome;
+      await f.cleanup();
+    }
+  },
+);
+
 test("conditional native message preserves identity and accepts a resident idle turn", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "conditional-admission-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
@@ -11686,6 +11853,20 @@ test("conditional native admission cannot replace a user turn reserved before it
       status: "rejected",
       reason: "busy",
     });
+    await expect(
+      f.manager.reloadAgentSession(
+        f.agent.id,
+        { model: "gpt-6.1-sol" },
+        {
+          admission: {
+            expected: f.input.expected,
+            expectedNativeTurnId: "original-turn",
+            expiresAt: f.input.expiresAt,
+            authorize: () => true,
+          },
+        },
+      ),
+    ).rejects.toThrow("Reload admission: busy");
     expect(f.probe.starts).toBe(1);
     expect(f.probe.interruptions).toBe(0);
     f.probe.release.resolve();
@@ -11752,6 +11933,20 @@ test("conditional native admission preserves a pending permission instead of ans
       status: "rejected",
       reason: "permission_pending",
     });
+    await expect(
+      f.manager.reloadAgentSession(
+        f.agent.id,
+        { model: "gpt-6.1-sol" },
+        {
+          admission: {
+            expected: f.input.expected,
+            expectedNativeTurnId: "original-turn",
+            expiresAt: f.input.expiresAt,
+            authorize: () => true,
+          },
+        },
+      ),
+    ).rejects.toThrow("Reload admission: permission_pending");
     expect(f.manager.getAgent(f.agent.id)?.pendingPermissions.has("permission-original")).toBe(
       true,
     );
