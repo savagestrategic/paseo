@@ -453,7 +453,7 @@ export interface SessionOptions {
   worktreesRoot?: string;
   agentManager: AgentManager;
   agentStorage: AgentStorage;
-  messageReceipts: Pick<MessageReceipts, "send" | "admit">;
+  messageReceipts: Pick<MessageReceipts, "send" | "admit" | "reload">;
   creationService: Pick<CreationService, "create" | "subscribe">;
   projectRegistry: ProjectRegistry;
   workspaceRegistry: WorkspaceRegistry;
@@ -784,7 +784,7 @@ export class Session {
   private readonly daemonSession: DaemonSession;
   private readonly hubExecutionController: HubExecutionController | null;
   private readonly workspaceScripts: WorkspaceScriptsService;
-  private readonly messageReceipts: Pick<MessageReceipts, "send" | "admit">;
+  private readonly messageReceipts: Pick<MessageReceipts, "send" | "admit" | "reload">;
   private readonly createAgentLifecycleDispatch: CreateAgentLifecycleDispatch;
   private readonly creationService: Pick<CreationService, "create" | "subscribe">;
 
@@ -2711,6 +2711,8 @@ export class Session {
 
   private dispatchAgentLifecycleMessage(msg: SessionInboundMessage): Promise<void> | undefined {
     switch (msg.type) {
+      case "agent.session.reload.admit.request":
+        return this.handleAdmitAgentReloadRequest(msg);
       case "agent.runtime.refresh.request":
         return this.handleRefreshAgentRuntimeInfo(msg);
       case "fetch_agents_request":
@@ -8074,6 +8076,29 @@ export class Session {
       const { provisionalTitle } = resolveCreateAgentTitles({ initialPrompt: text });
       if (provisionalTitle) await this.agentManager.setTitle(agentId, provisionalTitle);
     }
+  }
+
+  private async handleAdmitAgentReloadRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.session.reload.admit.request" }>,
+  ): Promise<void> {
+    const signal = this.delivery.requestSignal;
+    // Pin the whole payload before waiting on receipt or lifecycle ownership.
+    const pinned = structuredClone(msg);
+    const { type: _type, requestId, operationId, ...input } = pinned;
+    const result = await this.messageReceipts.reload({
+      agentId: input.agentId,
+      operationId,
+      request: input,
+      reload: () =>
+        this.agentManager.admitAgentReload({
+          ...input,
+          authorize: () => !signal.aborted && this.authorization.allowsInbound(pinned),
+        }),
+    });
+    this.emit({
+      type: "agent.session.reload.admit.response",
+      payload: { requestId, agentId: input.agentId, operationId, result },
+    });
   }
 
   private async handleAdmitAgentMessageRequest(

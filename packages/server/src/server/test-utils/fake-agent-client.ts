@@ -335,6 +335,7 @@ class FakeAgentSession implements AgentSession {
   private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
   private nextTurnOrdinal = 0;
   private activeForegroundTurnId: string | null = null;
+  private lastAcceptedTurnId: string | null = null;
 
   private readonly closeSession: (() => Promise<void>) | undefined;
   private readonly onStartTurn: ((prompt: AgentPromptInput) => void) | undefined;
@@ -440,6 +441,7 @@ class FakeAgentSession implements AgentSession {
 
     const turnId = `fake-turn-${this.nextTurnOrdinal++}`;
     this.activeForegroundTurnId = turnId;
+    this.lastAcceptedTurnId = turnId;
     this.onStartTurn?.(prompt);
 
     void this.emitTurnEvents(prompt);
@@ -836,6 +838,11 @@ class FakeAgentSession implements AgentSession {
       sessionId: this.id,
       model: this.config.model ?? null,
       modeId: this.config.modeId ?? null,
+      extra: {
+        acceptedTurnRequest: this.lastAcceptedTurnId
+          ? { sessionId: this.id, nativeTurnId: this.lastAcceptedTurnId }
+          : null,
+      },
     };
   }
 

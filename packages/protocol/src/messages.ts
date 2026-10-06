@@ -1418,6 +1418,19 @@ export const AgentReloadAdmissionResultSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("outcome_unknown") }),
 ]);
 
+export const AdmitAgentReloadRequestSchema = z.object({
+  type: z.literal("agent.session.reload.admit.request"),
+  requestId: z.string(),
+  agentId: z.string().min(1),
+  operationId: z.string().min(1).max(256),
+  expected: AgentMessageAdmissionExpectationSchema,
+  expectedNativeTurnId: z.string().min(1).max(256),
+  model: z.string().min(1).max(256),
+  thinkingOptionId: z.string().min(1).max(128),
+  appServerArgs: z.array(z.string().max(16384)).max(128).optional(),
+  expiresAt: z.string(),
+});
+
 export const RefreshAgentRuntimeInfoRequestSchema = z.object({
   type: z.literal("agent.runtime.refresh.request"),
   requestId: z.string(),
@@ -3254,6 +3267,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   SetVoiceModeMessageSchema,
   SendAgentMessageRequestSchema,
   AdmitAgentMessageRequestSchema,
+  AdmitAgentReloadRequestSchema,
   RefreshAgentRuntimeInfoRequestSchema,
   WaitForFinishRequestSchema,
   DaemonGetStatusRequestSchema,
@@ -3747,6 +3761,9 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(agentRuntimeRefresh): added after v0.10.3; remove the gate
         // after 2027-04-05 only when the supported daemon floor includes it.
         agentRuntimeRefresh: z.boolean().optional(),
+        // COMPAT(conditionalAgentReloads): added after v0.10.3; remove the gate
+        // after 2027-04-05 only when the supported daemon floor includes it.
+        conditionalAgentReloads: z.boolean().optional(),
         // COMPAT(canonicalSubmittedPrompts): added in v0.2.6, remove gate after 2027-01-30.
         canonicalSubmittedPrompts: z.boolean().optional(),
         // COMPAT(agentTurnIdentity): accept peers that observed pre-release v0.2.6 through 2027-01-31.
@@ -4995,6 +5012,16 @@ export const AdmitAgentMessageResponseSchema = z.object({
     agentId: z.string(),
     messageId: z.string(),
     result: AgentMessageAdmissionResultSchema,
+  }),
+});
+
+export const AdmitAgentReloadResponseSchema = z.object({
+  type: z.literal("agent.session.reload.admit.response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    operationId: z.string(),
+    result: AgentReloadAdmissionResultSchema,
   }),
 });
 
@@ -6919,6 +6946,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceMarkUnreadResponseSchema,
   SendAgentMessageResponseMessageSchema,
   AdmitAgentMessageResponseSchema,
+  AdmitAgentReloadResponseSchema,
   RefreshAgentRuntimeInfoResponseSchema,
   SetVoiceModeResponseMessageSchema,
   DaemonGetStatusResponseSchema,
@@ -7240,6 +7268,7 @@ export type RefreshAgentRuntimeInfoResponse = z.infer<typeof RefreshAgentRuntime
 export type AdmitAgentMessageRequest = z.infer<typeof AdmitAgentMessageRequestSchema>;
 export type AgentMessageAdmissionResult = z.infer<typeof AgentMessageAdmissionResultSchema>;
 export type AgentReloadAdmissionResult = z.infer<typeof AgentReloadAdmissionResultSchema>;
+export type AdmitAgentReloadRequest = z.infer<typeof AdmitAgentReloadRequestSchema>;
 export type WaitForFinishRequest = z.infer<typeof WaitForFinishRequestSchema>;
 export type DictationStreamStartMessage = z.infer<typeof DictationStreamStartMessageSchema>;
 export type DictationStreamChunkMessage = z.infer<typeof DictationStreamChunkMessageSchema>;

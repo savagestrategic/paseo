@@ -290,6 +290,7 @@ export function createMessageReceiptsStub(): SessionOptions["messageReceipts"] {
   return {
     send: (input) => input.send(),
     admit: (input) => input.admit(),
+    reload: (input) => input.reload(),
   };
 }
 

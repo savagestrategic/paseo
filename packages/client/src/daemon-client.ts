@@ -3,6 +3,8 @@ import type {
   RefreshAgentRuntimeInfoRequest,
   RefreshAgentRuntimeInfoResponse,
   AgentMessageAdmissionResult,
+  AdmitAgentReloadRequest,
+  AgentReloadAdmissionResult,
 } from "@getpaseo/protocol/messages";
 import { subscribeTimeline, type TimelineMessage } from "./timeline-subscription/index.js";
 import { ProviderSnapshotUpdates } from "./provider-snapshots/index.js";
@@ -19,6 +21,7 @@ import type { SessionEventSubscription } from "@getpaseo/protocol/messages";
 import type { ClientCapability } from "@getpaseo/protocol/client-capabilities";
 import type { AgentAttentionNotificationPayload } from "@getpaseo/protocol/agent-attention-notification";
 import {
+  AdmitAgentReloadRequestSchema,
   AgentCreateFailedStatusPayloadSchema,
   AgentCreatedStatusPayloadSchema,
   AgentRefreshedStatusPayloadSchema,
@@ -3473,6 +3476,37 @@ export class DaemonClient {
           ? msg.payload
           : null,
     });
+    return payload.result;
+  }
+
+  async admitAgentReload(
+    input: Omit<AdmitAgentReloadRequest, "type" | "requestId">,
+  ): Promise<AgentReloadAdmissionResult> {
+    if (this.getLastServerInfoMessage()?.features?.conditionalAgentReloads !== true)
+      throw new Error("Host does not support conditional agent reload admission; update the host");
+    const requestId = this.createRequestId();
+    const message = AdmitAgentReloadRequestSchema.parse({
+      ...input,
+      type: "agent.session.reload.admit.request",
+      requestId,
+    });
+    const payload = await this.sendRequest({
+      requestId,
+      message,
+      options: { skipQueue: true },
+      select: (msg) =>
+        msg.type === "agent.session.reload.admit.response" &&
+        msg.payload.requestId === requestId &&
+        msg.payload.agentId === message.agentId &&
+        msg.payload.operationId === message.operationId
+          ? msg.payload
+          : null,
+    });
+    if (
+      payload.result.status === "reloaded" &&
+      payload.result.sessionId !== message.expected.sessionId
+    )
+      throw new Error("Reload response native identity changed");
     return payload.result;
   }
 

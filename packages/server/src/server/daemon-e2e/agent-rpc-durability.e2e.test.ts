@@ -319,3 +319,72 @@ test("conditional message RPC preserves one handoff across reconnect and does no
     rmSync(workdir, { recursive: true, force: true });
   }
 });
+
+test("conditional reload RPC keeps native custody and one effect across reconnect", async () => {
+  let closes = 0;
+  const daemon = await createTestPaseoDaemon({
+    mcpEnabled: false,
+    pluginsEnabled: false,
+    agentClients: createTestAgentClients({
+      closeSession: async () => {
+        closes++;
+      },
+    }),
+  });
+  let client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws`, appVersion: "0.10.3" });
+  const workdir = mkdtempSync(path.join(os.tmpdir(), "conditional-reload-work-"));
+  try {
+    await client.connect();
+    expect(client.getLastServerInfoMessage()?.features?.conditionalAgentReloads).toBe(true);
+    await client.fetchAgents();
+    const created = await client.createAgent({ config: { provider: "codex", cwd: workdir } });
+    await client.sendAgentMessage(created.id, "Complete this owned fixture turn.");
+    await client.waitForFinish(created.id, 10000);
+    const snapshot = (await client.fetchAgent({ agentId: created.id }))!.agent;
+    const input = {
+      agentId: created.id,
+      operationId: "one-owned-escalation",
+      model: "gpt-6.1-sol",
+      thinkingOptionId: "high",
+      expectedNativeTurnId: "fake-turn-0",
+      expected: {
+        provider: snapshot.provider,
+        sessionId: snapshot.persistence!.sessionId,
+        cwd: snapshot.cwd,
+        workspaceId: snapshot.workspaceId ?? null,
+        parentAgentId: snapshot.labels?.["paseo.parent-agent-id"] ?? null,
+        lastUserMessageAt: snapshot.lastUserMessageAt ?? null,
+        updatedAt: snapshot.updatedAt,
+      },
+      expiresAt: new Date(Date.now() + 60000).toISOString(),
+    };
+    const before = closes;
+    const first = await client.admitAgentReload(input);
+    expect(first).toEqual({ status: "reloaded", sessionId: snapshot.persistence!.sessionId });
+    expect(closes).toBe(before + 1);
+    const reloaded = (await client.fetchAgent({ agentId: created.id }))!.agent;
+    expect(reloaded.persistence?.sessionId).toBe(snapshot.persistence!.sessionId);
+    expect(reloaded.model).toBe("gpt-6.1-sol");
+    await client.close();
+    client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws`, appVersion: "0.10.3" });
+    await client.connect();
+    expect(await client.admitAgentReload(input)).toEqual(first);
+    expect(closes).toBe(before + 1);
+    expect(await client.admitAgentReload({ ...input, model: "different" })).toEqual({
+      status: "rejected",
+      reason: "operation_id_conflict",
+    });
+    await daemon.daemon.agentManager.archiveAgent(created.id);
+    expect(await client.admitAgentReload({ ...input, operationId: "must-not-restore" })).toEqual({
+      status: "rejected",
+      reason: "archived",
+    });
+    expect(typeof (await client.fetchAgent({ agentId: created.id }))?.agent.archivedAt).toBe(
+      "string",
+    );
+  } finally {
+    await client.close();
+    await daemon.close();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});

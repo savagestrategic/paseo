@@ -7181,3 +7181,142 @@ for (const error of [null, "Read-only runtime refresh unavailable or scope chang
     else expect(await pending).toEqual(runtimeInfo);
   });
 }
+
+function conditionalReloadInput() {
+  const { expected, expiresAt, agentId } = conditionalMessageInput();
+  return {
+    agentId,
+    expected,
+    expiresAt,
+    operationId: "owned-sol-escalation",
+    expectedNativeTurnId: "accepted-luna-turn",
+    model: "gpt-6.1-sol",
+    thinkingOptionId: "high",
+  };
+}
+
+test("conditional reload refuses an unsupported host without a legacy reload", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "reload",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connected = client.connect();
+  mock.triggerOpen();
+  await connected;
+  const before = mock.sent.length;
+  await expect(client.admitAgentReload(conditionalReloadInput())).rejects.toThrow(
+    "update the host",
+  );
+  expect(mock.sent.length).toBe(before);
+});
+
+for (const result of [
+  { status: "reloaded", sessionId: "native-original" },
+  { status: "rejected", reason: "permission_pending" },
+  { status: "outcome_unknown" },
+] as const) {
+  test(`conditional reload retains ${result.status} and correlates the whole operation`, async () => {
+    const mock = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "reload",
+      transportFactory: () => mock.transport,
+      reconnect: { enabled: false },
+    });
+    clients.push(client);
+    const connected = client.connect();
+    mock.triggerOpen({ features: { ownedSubscriptions: true, conditionalAgentReloads: true } });
+    await connected;
+    const input = conditionalReloadInput();
+    const pending = client.admitAgentReload(input);
+    const frame = parseSentFrame(mock.sent.at(-1));
+    expect(frame).toEqual({
+      ...input,
+      type: "agent.session.reload.admit.request",
+      requestId: expect.any(String),
+    });
+    // Later mutation of a caller-owned object cannot change correlation or native custody.
+    input.agentId = "different";
+    input.operationId = "different";
+    input.expected.sessionId = "different";
+    const payload = {
+      requestId: frame.requestId,
+      agentId: "recipient",
+      operationId: "owned-sol-escalation",
+      result,
+    };
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "agent.session.reload.admit.response",
+        payload: { ...payload, agentId: "different" },
+      }),
+    );
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "agent.session.reload.admit.response",
+        payload: { ...payload, operationId: "different" },
+      }),
+    );
+    mock.triggerMessage(
+      wrapSessionMessage({ type: "agent.session.reload.admit.response", payload }),
+    );
+    expect(await pending).toEqual(result);
+  });
+}
+
+test("conditional reload rejects a substituted native identity", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "reload",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connected = client.connect();
+  mock.triggerOpen({ features: { ownedSubscriptions: true, conditionalAgentReloads: true } });
+  await connected;
+  const pending = client.admitAgentReload(conditionalReloadInput());
+  const assertion = expect(pending).rejects.toThrow("native identity changed");
+  const frame = parseSentFrame(mock.sent.at(-1));
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.session.reload.admit.response",
+      payload: {
+        requestId: frame.requestId,
+        agentId: "recipient",
+        operationId: "owned-sol-escalation",
+        result: { status: "reloaded", sessionId: "substitute" },
+      },
+    }),
+  );
+  await assertion;
+});
+
+test("a lost conditional reload response is not automatically replayed on reconnect", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "reload-disconnect",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const features = { ownedSubscriptions: true, conditionalAgentReloads: true };
+  const connected = client.connect();
+  mock.triggerOpen({ features });
+  await connected;
+  const pending = client.admitAgentReload(conditionalReloadInput());
+  const assertion = expect(pending).rejects.toThrow();
+  expect(parseSentFrame(mock.sent.at(-1)).type).toBe("agent.session.reload.admit.request");
+  mock.triggerClose({ code: 1006, reason: "Lost after reload dispatch" });
+  await assertion;
+  const reconnected = client.connect();
+  mock.triggerOpen({ features });
+  await reconnected;
+  expect(mock.sent).toEqual([]);
+});
