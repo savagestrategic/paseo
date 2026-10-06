@@ -453,7 +453,7 @@ export interface SessionOptions {
   worktreesRoot?: string;
   agentManager: AgentManager;
   agentStorage: AgentStorage;
-  messageReceipts: Pick<MessageReceipts, "send" | "admit" | "reload">;
+  messageReceipts: Pick<MessageReceipts, "send" | "admit" | "reload" | "getReloadReceipt">;
   creationService: Pick<CreationService, "create" | "subscribe">;
   projectRegistry: ProjectRegistry;
   workspaceRegistry: WorkspaceRegistry;
@@ -784,7 +784,10 @@ export class Session {
   private readonly daemonSession: DaemonSession;
   private readonly hubExecutionController: HubExecutionController | null;
   private readonly workspaceScripts: WorkspaceScriptsService;
-  private readonly messageReceipts: Pick<MessageReceipts, "send" | "admit" | "reload">;
+  private readonly messageReceipts: Pick<
+    MessageReceipts,
+    "send" | "admit" | "reload" | "getReloadReceipt"
+  >;
   private readonly createAgentLifecycleDispatch: CreateAgentLifecycleDispatch;
   private readonly creationService: Pick<CreationService, "create" | "subscribe">;
 
@@ -2709,12 +2712,21 @@ export class Session {
     }
   }
 
-  private dispatchAgentLifecycleMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+  private dispatchAgentRuntimeMessage(msg: SessionInboundMessage): Promise<void> | undefined {
     switch (msg.type) {
+      case "agent.session.reload.get_receipt.request":
+        return this.handleGetAgentReloadReceiptRequest(msg);
       case "agent.session.reload.admit.request":
         return this.handleAdmitAgentReloadRequest(msg);
       case "agent.runtime.refresh.request":
         return this.handleRefreshAgentRuntimeInfo(msg);
+      default:
+        return undefined;
+    }
+  }
+
+  private dispatchAgentLifecycleMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    switch (msg.type) {
       case "fetch_agents_request":
         return this.handleFetchAgents(msg);
       case "fetch_agent_history_request":
@@ -2750,7 +2762,7 @@ export class Session {
       case "clear_agent_attention":
         return this.handleClearAgentAttention(msg.agentId, msg.requestId);
       default:
-        return this.dispatchAgentPromptMessage(msg);
+        return this.dispatchAgentRuntimeMessage(msg) ?? this.dispatchAgentPromptMessage(msg);
     }
   }
 
@@ -8076,6 +8088,22 @@ export class Session {
       const { provisionalTitle } = resolveCreateAgentTitles({ initialPrompt: text });
       if (provisionalTitle) await this.agentManager.setTitle(agentId, provisionalTitle);
     }
+  }
+
+  private async handleGetAgentReloadReceiptRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.session.reload.get_receipt.request" }>,
+  ): Promise<void> {
+    const pinned = structuredClone(msg);
+    const { type: _type, requestId, operationId, ...input } = pinned;
+    const result = await this.messageReceipts.getReloadReceipt({
+      agentId: input.agentId,
+      operationId,
+      request: input,
+    });
+    this.emit({
+      type: "agent.session.reload.get_receipt.response",
+      payload: { requestId, agentId: input.agentId, operationId, result },
+    });
   }
 
   private async handleAdmitAgentReloadRequest(

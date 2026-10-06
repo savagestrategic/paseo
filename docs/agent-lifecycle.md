@@ -275,3 +275,25 @@ Each agent is a single JSON file. Fields relevant to this doc:
 | `lastStatus`                                 | `AgentStatus` | `initializing` / `idle` / `running` / `error` / `closed`                           |
 
 See [`docs/data-model.md`](./data-model.md) for the full agent record.
+
+## Conditional reload receipt reconciliation
+
+`agent.session.reload.get_receipt.request` reads the existing durable reload
+receipt for the exact agent, operation ID and original reload parameters. Gate
+it on `server_info.features.agentReloadReceipts`; no legacy reload is a fallback.
+The SDK copies the parameters before asynchronous work and correlates the full
+operation and retained native session identity. Request IDs are transport
+correlation only and are excluded from the durable fingerprint.
+
+The lookup performs no lifecycle work, provider calls or receipt writes. It can
+read an archived or closed agent's receipt without loading or restoring it.
+It retains the same semantic authority as reload admission; workspace viewers
+cannot inspect these operation receipts.
+
+`missing` means no receipt was observed, not proof that the operation was never
+accepted. `pending` retains uncertainty, and `resolved` returns the recorded
+reload result, which can itself be `outcome_unknown`. `conflict` means the
+original parameters differ; `unavailable` means receipt evidence could not be
+read or validated. None of these observations permits automatic reload replay.
+A recorded `reloaded` result proves reload only; a newly accepted provider turn
+and its effective model, account and permissions require separate verification.

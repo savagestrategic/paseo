@@ -4,6 +4,8 @@ import type {
   RefreshAgentRuntimeInfoResponse,
   AgentMessageAdmissionResult,
   AdmitAgentReloadRequest,
+  GetAgentReloadReceiptRequest,
+  AgentReloadReceiptResult,
   AgentReloadAdmissionResult,
 } from "@getpaseo/protocol/messages";
 import { subscribeTimeline, type TimelineMessage } from "./timeline-subscription/index.js";
@@ -22,6 +24,7 @@ import type { ClientCapability } from "@getpaseo/protocol/client-capabilities";
 import type { AgentAttentionNotificationPayload } from "@getpaseo/protocol/agent-attention-notification";
 import {
   AdmitAgentReloadRequestSchema,
+  GetAgentReloadReceiptRequestSchema,
   AgentCreateFailedStatusPayloadSchema,
   AgentCreatedStatusPayloadSchema,
   AgentRefreshedStatusPayloadSchema,
@@ -3507,6 +3510,38 @@ export class DaemonClient {
       payload.result.sessionId !== message.expected.sessionId
     )
       throw new Error("Reload response native identity changed");
+    return payload.result;
+  }
+
+  async getAgentReloadReceipt(
+    input: Omit<GetAgentReloadReceiptRequest, "type" | "requestId">,
+  ): Promise<AgentReloadReceiptResult> {
+    if (this.getLastServerInfoMessage()?.features?.agentReloadReceipts !== true)
+      throw new Error("Host does not support agent reload receipt lookup; update the host");
+    const requestId = this.createRequestId();
+    const message = GetAgentReloadReceiptRequestSchema.parse({
+      ...input,
+      type: "agent.session.reload.get_receipt.request",
+      requestId,
+    });
+    const payload = await this.sendRequest({
+      requestId,
+      message,
+      options: { skipQueue: true },
+      select: (msg) =>
+        msg.type === "agent.session.reload.get_receipt.response" &&
+        msg.payload.requestId === requestId &&
+        msg.payload.agentId === message.agentId &&
+        msg.payload.operationId === message.operationId
+          ? msg.payload
+          : null,
+    });
+    if (
+      payload.result.status === "resolved" &&
+      payload.result.result.status === "reloaded" &&
+      payload.result.result.sessionId !== message.expected.sessionId
+    )
+      throw new Error("Reload receipt native identity changed");
     return payload.result;
   }
 

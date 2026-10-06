@@ -291,6 +291,7 @@ export function createMessageReceiptsStub(): SessionOptions["messageReceipts"] {
     send: (input) => input.send(),
     admit: (input) => input.admit(),
     reload: (input) => input.reload(),
+    getReloadReceipt: async () => ({ status: "missing" }),
   };
 }
 

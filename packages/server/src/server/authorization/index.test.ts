@@ -150,3 +150,20 @@ describe("SessionAuthorization", () => {
     expect(() => parseDaemonPermissions(["hub.execution.*"])).toThrow("Invalid daemon permission");
   });
 });
+
+test("reload receipts retain operation authority and deny workspace viewers", () => {
+  const request = inboundMessage("agent.session.reload.get_receipt.request");
+  const response = outboundMessage("agent.session.reload.get_receipt.response");
+  for (const permissions of [[], ["workspace.read"], ["daemon.read"]] as const) {
+    const authorization = new SessionAuthorization([...permissions]);
+    expect(authorization.allowsInbound(request)).toBe(false);
+    expect(authorization.allowsOutbound(response)).toBe(false);
+  }
+  for (const permission of ["workspace.write", "hub.execute"] as const) {
+    const authorization = new SessionAuthorization([permission]);
+    expect(authorization.allowsInbound(request)).toBe(true);
+    expect(authorization.allowsOutbound(response)).toBe(true);
+    authorization.replacePermissions([]);
+    expect(authorization.allowsOutbound(response)).toBe(false);
+  }
+});

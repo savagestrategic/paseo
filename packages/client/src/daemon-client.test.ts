@@ -7320,3 +7320,113 @@ test("a lost conditional reload response is not automatically replayed on reconn
   await reconnected;
   expect(mock.sent).toEqual([]);
 });
+
+test("reload receipt lookup requires its own capability without a reload fallback", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "receipt",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connected = client.connect();
+  mock.triggerOpen({ features: { conditionalAgentReloads: true } });
+  await connected;
+  const before = mock.sent.length;
+  await expect(client.getAgentReloadReceipt(conditionalReloadInput())).rejects.toThrow(
+    "update the host",
+  );
+  expect(mock.sent.length).toBe(before);
+});
+
+for (const result of [
+  { status: "missing" },
+  { status: "pending" },
+  { status: "conflict" },
+  { status: "unavailable" },
+  { status: "resolved", result: { status: "reloaded", sessionId: "native-original" } },
+  { status: "resolved", result: { status: "rejected", reason: "busy" } },
+  { status: "resolved", result: { status: "outcome_unknown" } },
+] as const) {
+  test(`reload receipt ${JSON.stringify(result)} remains correlated to the captured request`, async () => {
+    const mock = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "receipt",
+      transportFactory: () => mock.transport,
+      reconnect: { enabled: false },
+    });
+    clients.push(client);
+    const connected = client.connect();
+    mock.triggerOpen({ features: { agentReloadReceipts: true } });
+    await connected;
+    const input = conditionalReloadInput();
+    const pending = client.getAgentReloadReceipt(input);
+    const frame = parseSentFrame(mock.sent.at(-1));
+    expect(frame).toEqual({
+      ...input,
+      type: "agent.session.reload.get_receipt.request",
+      requestId: expect.any(String),
+    });
+    input.agentId = "changed";
+    input.operationId = "changed";
+    input.expected.sessionId = "changed";
+    const payload = {
+      requestId: frame.requestId,
+      agentId: "recipient",
+      operationId: "owned-sol-escalation",
+      result,
+    };
+    for (const wrong of [{ requestId: "wrong" }, { agentId: "wrong" }, { operationId: "wrong" }]) {
+      mock.triggerMessage(
+        wrapSessionMessage({
+          type: "agent.session.reload.get_receipt.response",
+          payload: { ...payload, ...wrong },
+        }),
+      );
+    }
+    mock.triggerMessage(
+      wrapSessionMessage({ type: "agent.session.reload.get_receipt.response", payload }),
+    );
+    expect(await pending).toEqual(result);
+  });
+}
+
+test("reload receipt rejects changed native identity and never replays a lost lookup", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "receipt",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const features = { agentReloadReceipts: true };
+  const connected = client.connect();
+  mock.triggerOpen({ features });
+  await connected;
+  const pending = client.getAgentReloadReceipt(conditionalReloadInput());
+  const assertion = expect(pending).rejects.toThrow("native identity changed");
+  const frame = parseSentFrame(mock.sent.at(-1));
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.session.reload.get_receipt.response",
+      payload: {
+        requestId: frame.requestId,
+        agentId: "recipient",
+        operationId: "owned-sol-escalation",
+        result: { status: "resolved", result: { status: "reloaded", sessionId: "substitute" } },
+      },
+    }),
+  );
+  await assertion;
+  const lost = client.getAgentReloadReceipt(conditionalReloadInput());
+  const lostAssertion = expect(lost).rejects.toThrow();
+  mock.triggerClose({ code: 1006, reason: "Lookup lost" });
+  await lostAssertion;
+  const reconnected = client.connect();
+  mock.triggerOpen({ features });
+  await reconnected;
+  expect(mock.sent).toEqual([]);
+});

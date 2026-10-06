@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rename, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, expect, test } from "vitest";
@@ -276,3 +276,85 @@ test("reload and message admission retain separate durable operation identities"
   expect(await restarted.admit(message)).toEqual({ status: "accepted", turnId: "next-turn" });
   expect({ reloads, messages }).toEqual({ reloads: 1, messages: 1 });
 });
+
+test("reload receipt lookup is read-only across missing, pending and reconstructed results", async () => {
+  const { requests, directory } = await fixture();
+  const input = {
+    agentId: "worker",
+    operationId: "lookup",
+    request: { expectedNativeTurnId: "luna", model: "gpt-6.1-sol" },
+  };
+  expect(await requests.getReloadReceipt(input)).toEqual({ status: "missing" });
+  expect(await readdir(directory)).toEqual([]);
+  let effects = 0;
+  await requests.reload({
+    ...input,
+    reload: async () => {
+      effects++;
+      expect(await requests.getReloadReceipt(input)).toEqual({ status: "pending" });
+      return { status: "reloaded", sessionId: "same-native" };
+    },
+  });
+  const file = path.join(directory, (await readdir(directory))[0]!);
+  const before = await readFile(file, "utf8");
+  const restarted = new MessageReceipts(directory);
+  expect(await restarted.getReloadReceipt(input)).toEqual({
+    status: "resolved",
+    result: { status: "reloaded", sessionId: "same-native" },
+  });
+  expect(await restarted.getReloadReceipt({ ...input, request: { model: "other" } })).toEqual({
+    status: "conflict",
+  });
+  expect(await readFile(file, "utf8")).toBe(before);
+  expect(effects).toBe(1);
+});
+
+test("reload lookup captures caller scope and preserves terminal rejection and uncertainty", async () => {
+  const { requests, directory } = await fixture();
+  for (const result of [
+    { status: "rejected", reason: "busy" },
+    { status: "outcome_unknown" },
+  ] as const) {
+    const input = { agentId: "worker", operationId: result.status, request: { model: "sol" } };
+    await requests.reload({ ...input, reload: async () => result });
+    const restarted = new MessageReceipts(directory);
+    const lookup = restarted.getReloadReceipt(input);
+    input.request.model = "changed";
+    expect(await lookup).toEqual({ status: "resolved", result });
+    expect(await restarted.getReloadReceipt(input)).toEqual({ status: "conflict" });
+  }
+});
+
+test.each(["json", "schema", "agent", "io"])(
+  "reload lookup reports unavailable %s evidence without repairing or writing it",
+  async (scenario) => {
+    const { requests, directory } = await fixture();
+    const input = { agentId: "worker", operationId: "malformed", request: {} };
+    await requests.reload({
+      ...input,
+      reload: async () => ({ status: "rejected", reason: "busy" }),
+    });
+    const file = path.join(directory, (await readdir(directory))[0]!);
+    const retained = JSON.parse(await readFile(file, "utf8"));
+    if (scenario === "io") {
+      await rm(file);
+      await mkdir(file);
+    } else {
+      const bytes =
+        scenario === "json"
+          ? "{"
+          : JSON.stringify({
+              ...retained,
+              ...(scenario === "schema"
+                ? { result: { status: "reloaded", sessionId: "" } }
+                : { agentId: "other" }),
+            });
+      await writeFile(file, bytes);
+      expect(await requests.getReloadReceipt(input)).toEqual({ status: "unavailable" });
+      expect(await readFile(file, "utf8")).toBe(bytes);
+      return;
+    }
+    expect(await requests.getReloadReceipt(input)).toEqual({ status: "unavailable" });
+    expect(await readdir(file)).toEqual([]);
+  },
+);

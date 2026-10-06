@@ -7,6 +7,7 @@ import {
   AgentReloadAdmissionResultSchema,
   type AgentMessageAdmissionResult,
   type AgentReloadAdmissionResult,
+  type AgentReloadReceiptResult,
 } from "@getpaseo/protocol/messages";
 
 function admissionReceiptSchema<T>(resultSchema: z.ZodType<T>) {
@@ -79,6 +80,30 @@ export class MessageReceipts {
         { status: "outcome_unknown" },
       ),
     );
+  }
+
+  async getReloadReceipt(
+    input: Omit<AdmitReloadInput, "reload">,
+  ): Promise<AgentReloadReceiptResult> {
+    const captured = { ...input, request: structuredClone(input.request) };
+    const key = digest(["reload", captured.agentId, captured.operationId]);
+    const fingerprint = digest(captured.request);
+    // Do not enqueue behind an effect or create a receipt: even an in-flight
+    // reload must be observable without repeating it or waiting on the provider.
+    try {
+      const receipt = admissionReceiptSchema(AgentReloadAdmissionResultSchema).parse(
+        JSON.parse(await readFile(path.join(this.directory, `${key}.json`), "utf8")),
+      );
+      if (receipt.agentId !== captured.agentId) return { status: "unavailable" };
+      if (receipt.fingerprint !== fingerprint) return { status: "conflict" };
+      return receipt.state === "pending"
+        ? { status: "pending" }
+        : { status: "resolved", result: receipt.result };
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT")
+        return { status: "missing" };
+      return { status: "unavailable" };
+    }
   }
 
   private serializeAdmission<T>(

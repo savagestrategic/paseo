@@ -359,7 +359,14 @@ test("conditional reload RPC keeps native custody and one effect across reconnec
       expiresAt: new Date(Date.now() + 60000).toISOString(),
     };
     const before = closes;
+    expect(client.getLastServerInfoMessage()?.features?.agentReloadReceipts).toBe(true);
+    expect(await client.getAgentReloadReceipt(input)).toEqual({ status: "missing" });
+    expect(closes).toBe(before);
     const first = await client.admitAgentReload(input);
+    expect(await client.getAgentReloadReceipt(input)).toEqual({
+      status: "resolved",
+      result: first,
+    });
     expect(first).toEqual({ status: "reloaded", sessionId: snapshot.persistence!.sessionId });
     expect(closes).toBe(before + 1);
     const reloaded = (await client.fetchAgent({ agentId: created.id }))!.agent;
@@ -368,6 +375,13 @@ test("conditional reload RPC keeps native custody and one effect across reconnec
     await client.close();
     client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws`, appVersion: "0.10.3" });
     await client.connect();
+    expect(await client.getAgentReloadReceipt(input)).toEqual({
+      status: "resolved",
+      result: first,
+    });
+    expect(
+      await client.getAgentReloadReceipt({ ...input, expectedNativeTurnId: "changed" }),
+    ).toEqual({ status: "conflict" });
     expect(await client.admitAgentReload(input)).toEqual(first);
     expect(closes).toBe(before + 1);
     expect(await client.admitAgentReload({ ...input, model: "different" })).toEqual({
@@ -379,6 +393,18 @@ test("conditional reload RPC keeps native custody and one effect across reconnec
       status: "rejected",
       reason: "archived",
     });
+    const afterArchive = closes;
+    expect(await client.getAgentReloadReceipt(input)).toEqual({
+      status: "resolved",
+      result: first,
+    });
+    expect(
+      await client.getAgentReloadReceipt({ ...input, operationId: "must-not-restore" }),
+    ).toEqual({ status: "resolved", result: { status: "rejected", reason: "archived" } });
+    expect(await client.getAgentReloadReceipt({ ...input, operationId: "never-started" })).toEqual({
+      status: "missing",
+    });
+    expect(closes).toBe(afterArchive);
     expect(typeof (await client.fetchAgent({ agentId: created.id }))?.agent.archivedAt).toBe(
       "string",
     );

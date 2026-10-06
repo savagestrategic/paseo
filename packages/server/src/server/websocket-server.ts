@@ -1790,6 +1790,7 @@ export class VoiceAssistantWebSocketServer {
         conditionalAgentMessages: true,
         agentRuntimeRefresh: true,
         conditionalAgentReloads: true,
+        agentReloadReceipts: true,
         agentRequestReceipts: true,
         workspaceRequestReceipts: true,
         creationLifecycle: true,
