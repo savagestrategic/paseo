@@ -1,3 +1,4 @@
+import { AgentCumulativeUsageObservationSchema } from "@getpaseo/protocol/messages";
 import type {
   AgentListItemPayload,
   AgentSnapshotPayload,
@@ -441,7 +442,7 @@ function sanitizeMetadataArray(value: unknown): AgentMetadata[] | undefined {
   return sanitized.length > 0 ? sanitized : undefined;
 }
 
-type UsageNumericField = Exclude<keyof AgentUsage, never>;
+type UsageNumericField = Exclude<keyof AgentUsage, "cumulativeObservation">;
 
 function assignFiniteNumber(
   source: { [key: string]: JsonValue },
@@ -474,6 +475,13 @@ function sanitizeUsage(value: unknown): AgentUsage | undefined {
     if (!assignFiniteNumber(sanitized, result, field)) {
       return undefined;
     }
+  }
+  if (sanitized.cumulativeObservation !== undefined) {
+    const observation = AgentCumulativeUsageObservationSchema.safeParse(
+      sanitized.cumulativeObservation,
+    );
+    if (!observation.success) return undefined;
+    result.cumulativeObservation = observation.data;
   }
   return Object.keys(result).length ? result : undefined;
 }

@@ -2928,6 +2928,112 @@ describe("Codex app-server provider", () => {
     });
   });
 
+  test.each(["totalTokens", "total_tokens"])(
+    "binds explicit cumulative %s to the native session observation",
+    (field) => {
+      const context = { sessionId: "test-thread", observedAt: "2026-10-05T12:00:00.000Z" };
+      expect(toAgentUsage({ total: { [field]: 1234 } }, context)).toEqual({
+        inputTokens: undefined,
+        cachedInputTokens: undefined,
+        outputTokens: undefined,
+        cumulativeObservation: {
+          source: "codex-app-server-thread-token-usage",
+          ...context,
+          cumulativeObservedTokens: 1234,
+        },
+      });
+    },
+  );
+
+  test.each([0, Number.MAX_SAFE_INTEGER])("accepts cumulative boundary %s", (count) => {
+    expect(
+      toAgentUsage(
+        { total: { totalTokens: count } },
+        {
+          sessionId: "test-thread",
+          observedAt: "2026-10-05T12:00:00.000Z",
+        },
+      )?.cumulativeObservation?.cumulativeObservedTokens,
+    ).toBe(count);
+  });
+
+  test.each([-1, 1.5, "12", Number.NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, null])(
+    "omits invalid cumulative count %s",
+    (count) => {
+      expect(
+        toAgentUsage(
+          { total: { totalTokens: count }, last: { totalTokens: 99 } },
+          {
+            sessionId: "test-thread",
+            observedAt: "2026-10-05T12:00:00.000Z",
+          },
+        )?.cumulativeObservation,
+      ).toBeUndefined();
+    },
+  );
+
+  test("does not infer cumulative usage from context usage or an unscoped total", () => {
+    expect(toAgentUsage({ total: { totalTokens: 1234 } })?.cumulativeObservation).toBeUndefined();
+    expect(
+      toAgentUsage(
+        { last: { totalTokens: 1234 } },
+        {
+          sessionId: "test-thread",
+          observedAt: "2026-10-05T12:00:00.000Z",
+        },
+      )?.cumulativeObservation,
+    ).toBeUndefined();
+  });
+
+  test("observes only the owning native thread and leaves foreign usage unapplied", () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    asInternals(session).handleNotification("thread/tokenUsage/updated", {
+      threadId: "test-thread",
+      tokenUsage: { total: { totalTokens: 4321 } },
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "usage_updated",
+      provider: "codex",
+      usage: {
+        cumulativeObservation: {
+          source: "codex-app-server-thread-token-usage",
+          sessionId: "test-thread",
+          cumulativeObservedTokens: 4321,
+          observedAt: expect.any(String),
+        },
+      },
+    });
+    asInternals(session).handleNotification("thread/tokenUsage/updated", {
+      threadId: "foreign-thread",
+      tokenUsage: { total: { totalTokens: 9999 } },
+    });
+    expect(events).toHaveLength(1);
+  });
+
+  test("unidentified usage keeps legacy fields without attributing a cumulative count", () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    asInternals(session).handleNotification("thread/tokenUsage/updated", {
+      tokenUsage: { total: { totalTokens: 1234 }, last: { outputTokens: 10 } },
+    });
+    expect(events).toEqual([
+      {
+        type: "usage_updated",
+        provider: "codex",
+        turnId: "test-turn",
+        usage: {
+          inputTokens: undefined,
+          cachedInputTokens: undefined,
+          outputTokens: 10,
+        },
+      },
+    ]);
+  });
+
   test("normalizes raw output schemas for Codex structured outputs", () => {
     const input = {
       type: "object",

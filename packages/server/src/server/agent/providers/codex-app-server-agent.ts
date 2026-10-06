@@ -1140,10 +1140,18 @@ function filterCodexThreadsByCwd(
   );
 }
 
-export function toAgentUsage(tokenUsage: unknown): AgentUsage | undefined {
+export function toAgentUsage(
+  tokenUsage: unknown,
+  observation?: { sessionId: string; observedAt: string },
+): AgentUsage | undefined {
   const usage = toObjectRecord(tokenUsage);
   if (!usage) return undefined;
   const last = toObjectRecord(usage.last);
+  const total = toObjectRecord(usage.total);
+  const cumulativeObservedTokens = [total?.totalTokens, total?.total_tokens].find(
+    (value): value is number =>
+      typeof value === "number" && Number.isSafeInteger(value) && value >= 0,
+  );
   const contextWindowMaxTokens = firstPositiveFiniteNumber(
     usage.model_context_window,
     usage.modelContextWindow,
@@ -1156,6 +1164,15 @@ export function toAgentUsage(tokenUsage: unknown): AgentUsage | undefined {
     outputTokens: typeof last?.outputTokens === "number" ? last.outputTokens : undefined,
     ...(contextWindowMaxTokens !== undefined ? { contextWindowMaxTokens } : {}),
     ...(contextWindowUsedTokens !== undefined ? { contextWindowUsedTokens } : {}),
+    ...(observation && cumulativeObservedTokens !== undefined
+      ? {
+          cumulativeObservation: {
+            source: "codex-app-server-thread-token-usage" as const,
+            ...observation,
+            cumulativeObservedTokens,
+          },
+        }
+      : {}),
   };
 }
 
@@ -5319,6 +5336,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       config: this.buildCodexInnerConfig(),
       userMessageTurns: this.codexUserMessageTurns(),
       setThreadId: async (threadId) => {
+        if (this.currentThreadId !== threadId) this.latestUsage = undefined;
         this.currentThreadId = threadId;
         this.cachedRuntimeInfo = null;
         this.persistedHistory = [];
@@ -5660,6 +5678,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.currentMode = "auto-review";
       this.cachedRuntimeInfo = null;
     }
+    if (this.currentThreadId !== threadId) this.latestUsage = undefined;
     this.currentThreadId = threadId;
   }
 
@@ -6452,6 +6471,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private handleThreadStartedNotification(
     parsed: Extract<ParsedCodexNotification, { kind: "thread_started" }>,
   ): void {
+    if (this.currentThreadId !== parsed.threadId) this.latestUsage = undefined;
     this.currentThreadId = parsed.threadId;
     this.emitEvent({
       type: "thread_started",
@@ -6574,7 +6594,14 @@ export class CodexAppServerAgentSession implements AgentSession {
   private handleTokenUsageUpdatedNotification(
     parsed: Extract<ParsedCodexNotification, { kind: "token_usage_updated" }>,
   ): void {
-    this.latestUsage = toAgentUsage(parsed.tokenUsage);
+    // Sub-agent notifications share the app-server connection; never attribute them to this thread.
+    if (parsed.threadId !== null && parsed.threadId !== this.currentThreadId) return;
+    this.latestUsage = toAgentUsage(
+      parsed.tokenUsage,
+      parsed.threadId && parsed.threadId === this.currentThreadId
+        ? { sessionId: parsed.threadId, observedAt: new Date().toISOString() }
+        : undefined,
+    );
     if (this.latestUsage) {
       this.notifySubscribers({
         type: "usage_updated",

@@ -380,7 +380,16 @@ const AgentCapabilityFlagsSchema: z.ZodType<AgentCapabilityFlags> = z
   })
   .catchall(z.boolean());
 
+export const AgentCumulativeUsageObservationSchema = z.object({
+  source: z.literal("codex-app-server-thread-token-usage"),
+  sessionId: z.string().min(1),
+  observedAt: z.iso.datetime(),
+  cumulativeObservedTokens: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+});
+
 const AgentUsageSchema: z.ZodType<AgentUsage> = z.object({
+  // Optional: existing daemons omit this observation, and older clients ignore it.
+  cumulativeObservation: AgentCumulativeUsageObservationSchema.optional(),
   inputTokens: z.number().optional(),
   cachedInputTokens: z.number().optional(),
   outputTokens: z.number().optional(),

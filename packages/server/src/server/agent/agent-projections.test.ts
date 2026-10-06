@@ -413,6 +413,18 @@ describe("toAgentPayload", () => {
     expect(payload).not.toHaveProperty("lastUsage");
   });
 
+  it("preserves cumulative usage observation in projected snapshots", () => {
+    const observation = {
+      source: "codex-app-server-thread-token-usage" as const,
+      sessionId: "native-thread",
+      observedAt: "2026-10-05T12:00:00.000Z",
+      cumulativeObservedTokens: 0,
+    };
+    const agent = createManagedAgent({ lastUsage: { cumulativeObservation: observation } });
+    expect(toAgentPayload(agent).lastUsage).toEqual({ cumulativeObservation: observation });
+    expect(toAgentPayload(agent).lastUsage?.cumulativeObservation).not.toBe(observation);
+  });
+
   it("preserves context window usage fields when they are valid numbers", () => {
     const agent = createManagedAgent({
       lastUsage: {

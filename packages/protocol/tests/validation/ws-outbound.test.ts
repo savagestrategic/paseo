@@ -138,6 +138,57 @@ const SourceSchema = z.object({
     );
   });
 
+  it("preserves optional cumulative usage in the generated wire validator", () => {
+    const observation = {
+      source: "codex-app-server-thread-token-usage",
+      sessionId: "native-thread",
+      observedAt: "2026-10-05T12:00:00.000Z",
+      cumulativeObservedTokens: 0,
+    };
+    const envelope = (usage: unknown) => ({
+      type: "session",
+      message: {
+        type: "agent_stream",
+        payload: {
+          agentId: "agent-1",
+          timestamp: "2026-10-05T12:00:00.000Z",
+          event: { type: "turn_completed", provider: "codex", usage },
+        },
+      },
+    });
+    const message = envelope({ cumulativeObservation: observation });
+    expect(GeneratedWSOutboundMessageSchema.safeParse(message)).toEqual({
+      success: true,
+      data: message,
+    });
+    expect(GeneratedWSOutboundMessageSchema.safeParse(envelope({ outputTokens: 10 })).success).toBe(
+      true,
+    );
+    for (const count of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1, "12"]) {
+      expect(
+        GeneratedWSOutboundMessageSchema.safeParse(
+          envelope({
+            cumulativeObservation: { ...observation, cumulativeObservedTokens: count },
+          }),
+        ).success,
+      ).toBe(false);
+    }
+    expect(
+      GeneratedWSOutboundMessageSchema.safeParse(
+        envelope({
+          cumulativeObservation: { ...observation, sessionId: "" },
+        }),
+      ).success,
+    ).toBe(false);
+    expect(
+      GeneratedWSOutboundMessageSchema.safeParse(
+        envelope({
+          cumulativeObservation: { ...observation, observedAt: "invalid" },
+        }),
+      ).success,
+    ).toBe(false);
+  });
+
   it("accepts project config responses with and without setup commit status", () => {
     const payload = {
       requestId: "project-config-read",

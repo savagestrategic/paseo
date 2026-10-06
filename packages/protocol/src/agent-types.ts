@@ -187,6 +187,13 @@ export interface AgentRunOptions {
 }
 
 export interface AgentUsage {
+  /** Provider-observed cumulative total; consumers must bind a baseline and reject resets. */
+  cumulativeObservation?: {
+    source: "codex-app-server-thread-token-usage";
+    sessionId: string;
+    observedAt: string;
+    cumulativeObservedTokens: number;
+  };
   inputTokens?: number;
   cachedInputTokens?: number;
   outputTokens?: number;
