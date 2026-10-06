@@ -12,6 +12,7 @@ import {
   realpathSync,
   statSync,
   renameSync,
+  copyFileSync,
 } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -632,7 +633,9 @@ async function withCustomCodexProviderHome<T>(
   run: (input: {
     session: AgentSession;
     readCaptured: () => CapturedFakeCodexRecord[];
+    launchExecutable: string;
   }) => Promise<T>,
+  options: { copyExecutable?: boolean; config?: string } = {},
 ): Promise<T> {
   const tempDir = await mkdtemp(path.join(tmpdir(), "codex-provider-home-"));
   const daemonCodexHome = path.join(tempDir, "daemon-codex-home");
@@ -685,13 +688,19 @@ process.stdin.on("data", (chunk) => {
 `,
   );
 
+  if (options.config !== undefined)
+    writeFileSync(path.join(providerCodexHome, "config.toml"), options.config);
+  const launchExecutable = options.copyExecutable
+    ? path.join(tempDir, "owned-node")
+    : process.execPath;
+  if (options.copyExecutable) copyFileSync(process.execPath, launchExecutable);
   vi.stubEnv("CODEX_HOME", daemonCodexHome);
   const registry = buildProviderRegistry(createTestLogger(), {
     providerOverrides: {
       "profile-codex": {
         extends: "codex",
         label: "Profile Codex",
-        command: [process.execPath, fakeAppServerPath],
+        command: [launchExecutable, fakeAppServerPath],
         env: {
           CODEX_HOME: providerCodexHome,
           PASEO_FAKE_CODEX_CAPTURE: capturedRequestsPath,
@@ -708,6 +717,7 @@ process.stdin.on("data", (chunk) => {
   try {
     return await run({
       session,
+      launchExecutable,
       readCaptured: () =>
         readFileSync(capturedRequestsPath, "utf8")
           .trim()
@@ -1022,6 +1032,92 @@ describe("Codex app-server provider", () => {
       expect((await session.getRuntimeInfo()).extra?.runtimeHomeObservation).toMatchObject({
         codexHomeFingerprint: fingerprint,
       });
+    });
+  });
+
+  test("launch observation binds actual executable and arguments without exposing their paths", async () => {
+    await withCustomCodexProviderHome(async ({ session, readCaptured, launchExecutable }) => {
+      await session.startTurn("owned launch evidence");
+      const info = await session.getRuntimeInfo();
+      expect(info.extra?.runtimeLaunchObservation).toMatchObject({
+        source: "native-session-app-server-spawn",
+        sessionId: "thread-1",
+        nativeTurnId: "home-native-turn",
+        executableSha256: createHash("sha256").update(readFileSync(launchExecutable)).digest("hex"),
+        executablePathHash: createHash("sha256")
+          .update(realpathSync(launchExecutable))
+          .digest("hex"),
+        homeConfigFileSha256: null,
+      });
+      expect(info.extra?.runtimeLaunchObservation).toHaveProperty(
+        "argvSha256",
+        expect.stringMatching(/^[a-f0-9]{64}$/),
+      );
+      const serialized = JSON.stringify(info.extra?.runtimeLaunchObservation);
+      expect(serialized).not.toContain(launchExecutable);
+      expect(serialized).not.toContain(readCaptured()[0]?.CODEX_HOME);
+      const evidence = info.extra?.runtimeLaunchObservation as Record<string, unknown>;
+      evidence.executableSha256 = "caller mutation";
+      expect((await session.getRuntimeInfo()).extra?.runtimeLaunchObservation).toHaveProperty(
+        "executableSha256",
+        expect.stringMatching(/^[a-f0-9]{64}$/),
+      );
+    });
+  });
+
+  test("launch evidence refuses a replaced executable even with identical bytes", async () => {
+    await withCustomCodexProviderHome(
+      async ({ session, launchExecutable }) => {
+        await session.startTurn("owned launch evidence");
+        expect((await session.getRuntimeInfo()).extra?.runtimeLaunchObservation).toBeDefined();
+        renameSync(launchExecutable, `${launchExecutable}-retained`);
+        copyFileSync(process.execPath, launchExecutable);
+        const refreshed = await session.refreshRuntimeInfo!();
+        expect(refreshed.extra?.runtimeLaunchObservation).toBeUndefined();
+        expect(refreshed.extra?.runtimeHomeObservation).toBeDefined();
+        expect(refreshed.extra?.acceptedTurnRequest).toMatchObject({
+          nativeTurnId: "home-native-turn",
+        });
+      },
+      { copyExecutable: true },
+    );
+  });
+
+  test.each(["", 'model = "gpt-6-luna"\n'])(
+    "launch evidence hashes existing config bytes and rejects later drift: %s",
+    async (config) => {
+      await withCustomCodexProviderHome(
+        async ({ session, readCaptured }) => {
+          await session.startTurn("owned config evidence");
+          const info = await session.getRuntimeInfo();
+          expect(info.extra?.runtimeLaunchObservation).toHaveProperty(
+            "homeConfigFileSha256",
+            createHash("sha256").update(config).digest("hex"),
+          );
+          const homePath = readCaptured()[0]?.CODEX_HOME;
+          if (typeof homePath !== "string") throw new Error("Missing process home");
+          writeFileSync(path.join(homePath, "config.toml"), "# source changed\n" + config);
+          const refreshed = await session.refreshRuntimeInfo!();
+          expect(refreshed.extra?.runtimeLaunchObservation).toBeUndefined();
+          expect(refreshed.extra?.acceptedTurnRequest).toMatchObject({
+            nativeTurnId: "home-native-turn",
+          });
+        },
+        { config },
+      );
+    },
+  );
+
+  test("a home config created after spawn cannot qualify the retained launch", async () => {
+    await withCustomCodexProviderHome(async ({ session, readCaptured }) => {
+      await session.startTurn("owned launch evidence");
+      expect((await session.getRuntimeInfo()).extra?.runtimeLaunchObservation).toBeDefined();
+      const homePath = readCaptured()[0]?.CODEX_HOME;
+      if (typeof homePath !== "string") throw new Error("Missing process home");
+      writeFileSync(path.join(homePath, "config.toml"), 'model = "different"\n');
+      const refreshed = await session.refreshRuntimeInfo!();
+      expect(refreshed.extra?.runtimeLaunchObservation).toBeUndefined();
+      expect(refreshed.extra?.runtimeHomeObservation).toBeDefined();
     });
   });
 

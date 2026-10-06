@@ -252,9 +252,89 @@ interface CodexAppServerClientLike {
   dispose(): Promise<void>;
 }
 
+interface CodexLaunchFileReceipt {
+  path: string;
+  canonicalPath: string;
+  identity: string;
+  sha256: string;
+}
+
+interface CodexAppServerLaunchReceipt {
+  executable: CodexLaunchFileReceipt;
+  argvSha256: string;
+  homeConfigPath: string;
+  homeConfig: CodexLaunchFileReceipt | null;
+}
+
 interface CodexAppServerHomeReceipt {
   homePath: string;
   fingerprint: string;
+  launch: CodexAppServerLaunchReceipt | null;
+}
+
+async function readCodexLaunchFile(
+  filePath: string,
+  maxBytes: number,
+): Promise<CodexLaunchFileReceipt> {
+  if (!path.isAbsolute(filePath)) throw new Error("Launch file path is not absolute");
+  const canonicalPath = await fs.realpath(filePath);
+  const handle = await fs.open(canonicalPath, "r");
+  try {
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || before.size < 0n || before.size > BigInt(maxBytes))
+      throw new Error("Launch file is not a bounded regular file");
+    const digest = createHash("sha256");
+    const chunk = Buffer.alloc(64 * 1024);
+    let total = 0;
+    for (;;) {
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      if (!bytesRead) break;
+      total += bytesRead;
+      if (total > maxBytes) throw new Error("Launch file exceeded observation bound");
+      digest.update(chunk.subarray(0, bytesRead));
+    }
+    const after = await handle.stat({ bigint: true });
+    const identity = (stat: typeof before) =>
+      JSON.stringify({
+        device: String(stat.dev),
+        inode: String(stat.ino),
+        size: String(stat.size),
+        modified: String(stat.mtimeNs),
+        changed: String(stat.ctimeNs),
+      });
+    if (
+      identity(before) !== identity(after) ||
+      identity(await fs.stat(canonicalPath, { bigint: true })) !== identity(after) ||
+      (await fs.realpath(filePath)) !== canonicalPath
+    )
+      throw new Error("Launch file changed during observation");
+    return {
+      path: filePath,
+      canonicalPath,
+      identity: identity(after),
+      sha256: digest.digest("hex"),
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readCodexHomeConfig(filePath: string): Promise<CodexLaunchFileReceipt | null> {
+  try {
+    return await readCodexLaunchFile(filePath, 1024 * 1024);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+async function verifyCodexLaunchReceipt(receipt: CodexAppServerLaunchReceipt): Promise<boolean> {
+  const executable = await readCodexLaunchFile(receipt.executable.path, 256 * 1024 * 1024);
+  const homeConfig = await readCodexHomeConfig(receipt.homeConfigPath);
+  return (
+    JSON.stringify(executable) === JSON.stringify(receipt.executable) &&
+    JSON.stringify(homeConfig) === JSON.stringify(receipt.homeConfig)
+  );
 }
 
 async function readCodexHomeFingerprint(homePath: string): Promise<string> {
@@ -3415,6 +3495,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private runtimeAccountClient: CodexAppServerClientLike | null = null;
   private runtimeHomeReceipt: CodexAppServerHomeReceipt | null = null;
   private runtimeHomeObservation: Record<string, unknown> | null = null;
+  private runtimeLaunchObservation: Record<string, unknown> | null = null;
   private runtimeHomeClient: CodexAppServerClientLike | null = null;
   private serviceTier: "fast" | null = null;
   private planModeEnabled = false;
@@ -3628,6 +3709,7 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   private async observeRuntimeHome(): Promise<void> {
     this.runtimeHomeObservation = null;
+    this.runtimeLaunchObservation = null;
     this.runtimeHomeClient = null;
     const client = this.client,
       threadId = this.currentThreadId;
@@ -3650,6 +3732,29 @@ export class CodexAppServerAgentSession implements AgentSession {
         codexHomeFingerprint: fingerprint,
         observedAt: new Date().toISOString(),
       };
+      if (
+        receipt.launch &&
+        (await verifyCodexLaunchReceipt(receipt.launch)) &&
+        client === this.client &&
+        threadId === this.currentThreadId &&
+        request === this.acceptedTurnRequest &&
+        !this.closed
+      ) {
+        this.runtimeLaunchObservation = {
+          source: "native-session-app-server-spawn",
+          codexHomeFingerprint: fingerprint,
+          executablePathHash: createHash("sha256")
+            .update(receipt.launch.executable.canonicalPath)
+            .digest("hex"),
+          executableSha256: receipt.launch.executable.sha256,
+          argvSha256: receipt.launch.argvSha256,
+          homeConfigFileSha256: receipt.launch.homeConfig?.sha256 ?? null,
+          homeConfigFilePathHash: receipt.launch.homeConfig
+            ? createHash("sha256").update(receipt.launch.homeConfig.canonicalPath).digest("hex")
+            : null,
+          observedAt: new Date().toISOString(),
+        };
+      }
     } catch {
       this.logger.debug("Native Codex home observation unavailable");
     }
@@ -4740,6 +4845,13 @@ export class CodexAppServerAgentSession implements AgentSession {
       if (this.runtimeHomeObservation && this.runtimeHomeClient === this.client) {
         extra.runtimeHomeObservation = {
           ...this.runtimeHomeObservation,
+          sessionId: this.acceptedTurnRequest.sessionId,
+          nativeTurnId: this.acceptedTurnRequest.nativeTurnId,
+        };
+      }
+      if (this.runtimeLaunchObservation && this.runtimeHomeClient === this.client) {
+        extra.runtimeLaunchObservation = {
+          ...this.runtimeLaunchObservation,
           sessionId: this.acceptedTurnRequest.sessionId,
           nativeTurnId: this.acceptedTurnRequest.nativeTurnId,
         };
@@ -7399,9 +7511,22 @@ export class CodexAppServerAgentClient implements AgentClient {
     let receipt: CodexAppServerHomeReceipt | null = null;
     try {
       if (typeof homePath === "string" && homePath)
-        receipt = { homePath, fingerprint: await readCodexHomeFingerprint(homePath) };
+        receipt = { homePath, fingerprint: await readCodexHomeFingerprint(homePath), launch: null };
     } catch {
       this.logger.debug("Native Codex launch home observation unavailable");
+    }
+    if (receipt) {
+      try {
+        const homeConfigPath = path.join(receipt.homePath, "config.toml");
+        receipt.launch = {
+          executable: await readCodexLaunchFile(launchPrefix.command, 256 * 1024 * 1024),
+          argvSha256: createHash("sha256").update(JSON.stringify(args)).digest("hex"),
+          homeConfigPath,
+          homeConfig: await readCodexHomeConfig(homeConfigPath),
+        };
+      } catch {
+        this.logger.debug("Native Codex launch artifact observation unavailable");
+      }
     }
     const child = spawnProcess(launchPrefix.command, args, {
       detached: process.platform !== "win32",
