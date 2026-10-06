@@ -13,13 +13,20 @@ top-level provider options.
 
 This Paseo version accepts these keys:
 
-- **Codex:** `approval_policy`, `sandbox_mode`,
+- **Codex:** `appServerArgs`, `approval_policy`, `sandbox_mode`,
   `sandbox_workspace_write.{writable_roots,network_access,exclude_slash_tmp,exclude_tmpdir_env_var}`,
   `web_search`, `features.multi_agent_v2`, and `features.network_proxy`. A network proxy object may
   contain `enabled`, `proxy_url`, `socks_url`, `enable_socks5`, `enable_socks5_udp`,
   `allow_local_binding`, `allow_upstream_proxy`, `dangerously_allow_all_unix_sockets`,
   `dangerously_allow_non_loopback_proxy`, `domains`, and `unix_sockets`. See the
   [Codex configuration reference](https://developers.openai.com/codex/config-reference).
+  `appServerArgs` is a Paseo launch option: a bounded array of `--strict-config`,
+  `--stdio`, and `--config=<key>=<value>` arguments. It replaces provider-wide
+  `params.appServerArgs` for this session; an empty array suppresses those defaults.
+  It is retained with session configuration and excluded from Codex thread config.
+  Limits are 128 arguments, 16 KiB per argument and 64 KiB total. The existing
+  native Goals suffix and actual launch-argument evidence still apply. This option
+  alone does not establish runtime commissioning or model/permission acceptance.
 - **Claude:** `allowedTools`, `disallowedTools`, `additionalDirectories`, `extraArgs`, `sandbox`, and
   `settings`. `providerOptions.extraArgs` passes the SDK's documented
   [`Options.extraArgs`](https://platform.claude.com/docs/en/agent-sdk/typescript#options) map

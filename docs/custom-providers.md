@@ -351,6 +351,12 @@ For Codex, `params.appServerArgs` adds arguments after the `app-server` subcomma
 Use it for `--strict-config`, `--stdio`, and `--config=<key>=<value>` overrides.
 `command` remains the executable prefix. Other transport or remote-host arguments
 are rejected. Limits are 128 arguments, 16 KiB per argument and 64 KiB total.
+For an individual session, use `providerOptions.appServerArgs` in its existing
+session configuration. It replaces these provider-wide defaults, including when
+set to an empty array, and is excluded from Codex thread configuration. See
+[session options](providers.md#provider-native-session-options). Session reload
+retains the option through the existing lifecycle; this does not authorize a
+reload or qualify an escalation by itself.
 
 ```json
 {

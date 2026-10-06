@@ -16,6 +16,20 @@ const hubPolicy = {
 };
 
 describe("provider-owned option schemas", () => {
+  test("validates bounded session-specific Codex launch arguments through the provider contract", () => {
+    const appServerArgs = ["--strict-config", "--stdio", '--config=model="gpt-6-luna"'];
+    expect(
+      validateProviderOptions("codex", CodexProviderOptionsSchema, { appServerArgs }),
+    ).toMatchObject({ appServerArgs });
+    expect(() =>
+      validateProviderOptions("codex", CodexProviderOptionsSchema, { appServerArgs: [42] }),
+    ).toThrow("providerOptions.appServerArgs[0]");
+    expect(() =>
+      validateProviderOptions("codex", CodexProviderOptionsSchema, {
+        appServerArgs: Array(129).fill("--stdio"),
+      }),
+    ).toThrow("providerOptions.appServerArgs");
+  });
   test("accepts Codex native workspace-write and network policy nesting", () => {
     expect(
       CodexProviderOptionsSchema.parse({

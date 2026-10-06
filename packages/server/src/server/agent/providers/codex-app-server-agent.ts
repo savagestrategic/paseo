@@ -5695,7 +5695,8 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   private buildCodexInnerConfig(): Record<string, unknown> | null {
     const innerConfig: Record<string, unknown> = {};
-    Object.assign(innerConfig, this.providerOptions);
+    const { appServerArgs: _appServerArgs, ...nativeOptions } = this.providerOptions;
+    Object.assign(innerConfig, nativeOptions);
     if (this.deps.customCodexConfig) {
       Object.assign(innerConfig, this.deps.customCodexConfig);
     }
@@ -7524,9 +7525,9 @@ export class CodexAppServerAgentClient implements AgentClient {
     return buildCodexCustomProviderConfig(this.runtimeSettings, this.deps.customProvider);
   }
 
-  private appServerArgs(): string[] {
+  private appServerArgs(sessionArgs?: unknown): string[] {
     const params = toObjectRecord(this.deps.providerParams);
-    const value = params?.appServerArgs;
+    const value = sessionArgs ?? params?.appServerArgs;
     if (value === undefined) return [];
     if (
       !Array.isArray(value) ||
@@ -7604,10 +7605,14 @@ export class CodexAppServerAgentClient implements AgentClient {
 
   private async spawnAppServer(
     launchEnv?: Record<string, string>,
-    options?: { goalsEnabled?: boolean; agentId?: string },
+    options?: { goalsEnabled?: boolean; agentId?: string; appServerArgs?: unknown },
   ): Promise<ChildProcessWithoutNullStreams> {
     const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings);
-    const args = [...launchPrefix.args, "app-server", ...this.appServerArgs()];
+    const args = [
+      ...launchPrefix.args,
+      "app-server",
+      ...this.appServerArgs(options?.appServerArgs),
+    ];
     if (options?.goalsEnabled) {
       args.push("--enable", "goals");
     }
@@ -7678,7 +7683,11 @@ export class CodexAppServerAgentClient implements AgentClient {
       null,
       this.logger,
       () =>
-        this.spawnAppServer(launchContext?.env, { goalsEnabled, agentId: launchContext?.agentId }),
+        this.spawnAppServer(launchContext?.env, {
+          goalsEnabled,
+          agentId: launchContext?.agentId,
+          appServerArgs: sessionConfig.providerOptions?.appServerArgs,
+        }),
       this.sessionDeps(launchContext?.env),
       options?.persistSession === false,
       goalsEnabled,
@@ -7709,7 +7718,11 @@ export class CodexAppServerAgentClient implements AgentClient {
       handle,
       this.logger,
       () =>
-        this.spawnAppServer(launchContext?.env, { goalsEnabled, agentId: launchContext?.agentId }),
+        this.spawnAppServer(launchContext?.env, {
+          goalsEnabled,
+          agentId: launchContext?.agentId,
+          appServerArgs: merged.providerOptions?.appServerArgs,
+        }),
       this.sessionDeps(launchContext?.env),
       false,
       goalsEnabled,

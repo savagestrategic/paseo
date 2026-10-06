@@ -634,8 +634,14 @@ async function withCustomCodexProviderHome<T>(
     session: AgentSession;
     readCaptured: () => CapturedFakeCodexRecord[];
     launchExecutable: string;
+    resume: () => Promise<AgentSession>;
   }) => Promise<T>,
-  options: { copyExecutable?: boolean; config?: string; appServerArgs?: unknown } = {},
+  options: {
+    copyExecutable?: boolean;
+    config?: string;
+    appServerArgs?: unknown;
+    sessionAppServerArgs?: string[];
+  } = {},
 ): Promise<T> {
   const tempDir = await mkdtemp(path.join(tmpdir(), "codex-provider-home-"));
   const daemonCodexHome = path.join(tempDir, "daemon-codex-home");
@@ -715,10 +721,22 @@ process.stdin.on("data", (chunk) => {
       provider: "profile-codex",
       cwd: tempDir,
       modeId: "auto",
+      ...(options.sessionAppServerArgs
+        ? { providerOptions: { appServerArgs: options.sessionAppServerArgs } }
+        : {}),
     });
     return await run({
       session,
       launchExecutable,
+      resume: async () => {
+        const handle = session?.describePersistence();
+        if (!handle || !session) throw new Error("Missing owned fixture persistence");
+        await session.close();
+        session = await registry["profile-codex"]
+          .createClient(createTestLogger())
+          .resumeSession(handle);
+        return session;
+      },
       readCaptured: () =>
         readFileSync(capturedRequestsPath, "utf8")
           .trim()
@@ -1200,6 +1218,72 @@ describe("Codex app-server provider", () => {
       },
       { appServerArgs: args },
     );
+  });
+
+  test("session launch arguments replace provider defaults and remain outside native thread config", async () => {
+    const args = ["--strict-config", "--stdio", '--config=model="gpt-6.1-sol"'];
+    await withCustomCodexProviderHome(
+      async ({ session, readCaptured }) => {
+        await session.startTurn("owned session launch");
+        const records = readCaptured(),
+          argv = records[0]?.argv as string[];
+        expect(argv.slice(1)).toEqual(["app-server", ...args, "--enable", "goals"]);
+        expect(argv).not.toContain('--config=model="gpt-6-luna"');
+        let threadStart = false;
+        for (const record of records) {
+          if (record.kind !== "request") continue;
+          if (record.method === "thread/start") threadStart = true;
+          expect(JSON.stringify(record)).not.toContain("appServerArgs");
+        }
+        expect(threadStart).toBe(true);
+        expect((await session.getRuntimeInfo()).extra?.runtimeLaunchObservation).toHaveProperty(
+          "argvSha256",
+          createHash("sha256").update(JSON.stringify(argv)).digest("hex"),
+        );
+      },
+      { appServerArgs: ['--config=model="gpt-6-luna"'], sessionAppServerArgs: args },
+    );
+  });
+
+  test("explicit empty session launch arguments suppress provider defaults", async () => {
+    await withCustomCodexProviderHome(
+      async ({ session, readCaptured }) => {
+        await session.startTurn("owned empty launch");
+        const argv = readCaptured()[0]?.argv as string[];
+        expect(argv.slice(1)).toEqual(["app-server", "--enable", "goals"]);
+      },
+      { appServerArgs: ['--config=model="gpt-6-luna"'], sessionAppServerArgs: [] },
+    );
+  });
+
+  test("resuming the owned native session retains its individual launch arguments", async () => {
+    const args = ["--strict-config", '--config=model="gpt-6-luna"'];
+    await withCustomCodexProviderHome(
+      async ({ session, resume, readCaptured }) => {
+        await session.startTurn("owned initial launch");
+        const before = session.describePersistence();
+        const resumed = await resume();
+        await resumed.startTurn("owned resumed launch");
+        expect(resumed.describePersistence()?.sessionId).toBe(before?.sessionId);
+        let launches = 0;
+        for (const record of readCaptured()) {
+          if (record.kind !== "env") continue;
+          launches++;
+          const argv = record.argv as string[];
+          expect(argv.slice(1)).toEqual(["app-server", ...args, "--enable", "goals"]);
+        }
+        expect(launches).toBe(2);
+      },
+      { sessionAppServerArgs: args },
+    );
+  });
+
+  test("session launch arguments reject remote endpoints before spawning", async () => {
+    await expect(
+      withCustomCodexProviderHome(async () => undefined, {
+        sessionAppServerArgs: ["--listen=http://peer.invalid"],
+      }),
+    ).rejects.toThrow("Codex params.appServerArgs");
   });
 
   test.each([
