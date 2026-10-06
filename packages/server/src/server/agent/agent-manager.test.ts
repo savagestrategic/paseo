@@ -2456,6 +2456,36 @@ test("reload releases the original writer before resuming the same session", asy
   }
 });
 
+test("reload refuses a foreground start while the old writer is closing", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-reload-start-race-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new HeldReloadCloseClient();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  const reloading = manager.reloadAgentSession(created.id);
+  try {
+    await client.waitForCloseToStart();
+    expect(() => manager.streamAgent(created.id, "Racing user start")).toThrow(
+      "session is being reloaded",
+    );
+    client.finishClosing();
+    const replacement = await reloading;
+    expect(replacement.id).toBe(created.id);
+    expect(client.originalSessionClosed).toBe(true);
+    // The reservation must release for the replacement writer.
+    const turn = manager.streamAgent(created.id, "Use the replacement");
+    await turn.return();
+  } finally {
+    client.finishClosing();
+    await reloading.catch(() => undefined);
+    await manager.closeAgent(created.id);
+    await storage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("opening during reload waits for the replacement", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-reload-open-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
@@ -2529,6 +2559,9 @@ test("retrying a timed-out reload waits for the original close to finish", async
     });
     await expect(manager.reloadAgentSession(created.id)).rejects.toThrow("Timed out closing");
     expect(manager.getAgent(created.id)?.lifecycle).toBe("error");
+    expect(() => manager.streamAgent(created.id, "Start after timeout")).toThrow(
+      "session is being reloaded",
+    );
     const retry = manager.reloadAgentSession(created.id);
     client.finishClosing();
     expect((await retry).id).toBe(created.id);

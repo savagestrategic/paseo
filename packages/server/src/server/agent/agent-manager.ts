@@ -749,6 +749,7 @@ export class AgentManager {
   private readonly agentRegistrationTasks = new Set<Promise<void>>();
   private readonly inFlightAgentCloses = new Map<string, Promise<void>>();
   private readonly reloadedSessionCloses = new WeakMap<AgentSession, Promise<void>>();
+  private readonly reloadingAgents = new Set<string>();
   private readonly lifecycleMutationTails = new Map<string, Promise<void>>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
@@ -1547,9 +1548,16 @@ export class AgentManager {
     options?: { rehydrateFromDisk?: boolean },
   ): Promise<ManagedAgent> {
     return this.trackAgentRegistrationOperation(
-      this.runLifecycleMutation(agentId, () =>
-        this.reloadAgentSessionInternal(agentId, overrides, options),
-      ),
+      this.runLifecycleMutation(agentId, async () => {
+        // Foreground starts do not acquire the lifecycle lane. Reserve the
+        // resident writer before preparation or close can yield to a start.
+        this.reloadingAgents.add(agentId);
+        try {
+          return await this.reloadAgentSessionInternal(agentId, overrides, options);
+        } finally {
+          this.reloadingAgents.delete(agentId);
+        }
+      }),
     );
   }
 
@@ -2628,6 +2636,14 @@ export class AgentManager {
     options?: AgentRunOptions,
   ): AsyncGenerator<AgentStreamEvent> {
     const existingAgent = this.requireSessionAgent(agentId);
+    if (
+      this.reloadingAgents.has(agentId) ||
+      this.reloadedSessionCloses.has(existingAgent.session)
+    ) {
+      // A timed-out close still owns the old writer. Do not release it merely
+      // because the reload request returned before that close settled.
+      throw new Error(`Agent ${agentId} session is being reloaded`);
+    }
     this.logger.trace(
       {
         agentId,
