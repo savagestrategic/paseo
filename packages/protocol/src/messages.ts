@@ -1399,6 +1399,25 @@ export const AdmitAgentMessageRequestSchema = z.object({
   expiresAt: z.string(),
 });
 
+export const AgentReloadAdmissionResultSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("reloaded"), sessionId: z.string().min(1) }),
+  z.object({
+    status: z.literal("rejected"),
+    reason: z.enum([
+      "not_found",
+      "archived",
+      "not_idle",
+      "busy",
+      "permission_pending",
+      "scope_changed",
+      "expired",
+      "not_authorized",
+      "operation_id_conflict",
+    ]),
+  }),
+  z.object({ status: z.literal("outcome_unknown") }),
+]);
+
 export const RefreshAgentRuntimeInfoRequestSchema = z.object({
   type: z.literal("agent.runtime.refresh.request"),
   requestId: z.string(),
@@ -7220,6 +7239,7 @@ export type RefreshAgentRuntimeInfoResponse = z.infer<typeof RefreshAgentRuntime
 
 export type AdmitAgentMessageRequest = z.infer<typeof AdmitAgentMessageRequestSchema>;
 export type AgentMessageAdmissionResult = z.infer<typeof AgentMessageAdmissionResultSchema>;
+export type AgentReloadAdmissionResult = z.infer<typeof AgentReloadAdmissionResultSchema>;
 export type WaitForFinishRequest = z.infer<typeof WaitForFinishRequestSchema>;
 export type DictationStreamStartMessage = z.infer<typeof DictationStreamStartMessageSchema>;
 export type DictationStreamChunkMessage = z.infer<typeof DictationStreamChunkMessageSchema>;

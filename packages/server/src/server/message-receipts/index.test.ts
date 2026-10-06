@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, expect, test } from "vitest";
@@ -135,4 +135,144 @@ test("conditional changed payload conflicts and a refusal does not become an eve
   });
   expect(await requests.admit(input)).toEqual({ status: "rejected", reason: "busy" });
   expect(calls).toBe(1);
+});
+
+test("reload persists uncertainty before effects and reuses one result across retries", async () => {
+  const { requests, directory } = await fixture();
+  let reloads = 0;
+  const input = {
+    agentId: "worker",
+    operationId: "escalation",
+    request: { expectedNativeTurnId: "luna-turn", model: "gpt-6.1-sol" },
+    reload: async () => {
+      reloads++;
+      const files = await readdir(directory);
+      expect(files).toHaveLength(1);
+      expect(JSON.parse(await readFile(path.join(directory, files[0]!), "utf8"))).toMatchObject({
+        state: "pending",
+        agentId: "worker",
+      });
+      // A reconstructed connection cannot replay an operation still in flight.
+      expect(await new MessageReceipts(directory).reload(input)).toEqual({
+        status: "outcome_unknown",
+      });
+      return { status: "reloaded" as const, sessionId: "same-native-worker" };
+    },
+  };
+  const expected = { status: "reloaded", sessionId: "same-native-worker" };
+  expect(await Promise.all([requests.reload(input), requests.reload(input)])).toEqual([
+    expected,
+    expected,
+  ]);
+  expect(await new MessageReceipts(directory).reload(input)).toEqual(expected);
+  expect(reloads).toBe(1);
+});
+
+test("reload scope conflicts and refusals stay terminal after reconstruction", async () => {
+  const { requests, directory } = await fixture();
+  let reloads = 0;
+  const input = {
+    agentId: "worker",
+    operationId: "escalation",
+    request: { model: "gpt-6.1-sol" },
+    reload: async () => {
+      reloads++;
+      return { status: "rejected" as const, reason: "busy" as const };
+    },
+  };
+  expect(await requests.reload(input)).toEqual({ status: "rejected", reason: "busy" });
+  const restarted = new MessageReceipts(directory);
+  expect(await restarted.reload({ ...input, request: { model: "other" } })).toEqual({
+    status: "rejected",
+    reason: "operation_id_conflict",
+  });
+  expect(await restarted.reload(input)).toEqual({ status: "rejected", reason: "busy" });
+  expect(reloads).toBe(1);
+});
+
+test.each(["provider", "invalid_result", "receipt_failure"])(
+  "reload %s uncertainty survives restart without repeating effects",
+  async (scenario) => {
+    const { requests, directory } = await fixture();
+    let reloads = 0;
+    const input = {
+      agentId: "worker",
+      operationId: "uncertain",
+      request: {},
+      reload: async () => {
+        reloads++;
+        if (scenario === "provider") throw new Error("Close may have completed");
+        if (scenario === "invalid_result") return { status: "reloaded" as const, sessionId: "" };
+        // Make the atomic acceptance write fail after the provider effect,
+        // retaining the original pending receipt for inspection.
+        const file = (await readdir(directory))[0]!;
+        await rename(path.join(directory, file), path.join(directory, `${file}.retained`));
+        await mkdir(path.join(directory, file));
+        return { status: "reloaded" as const, sessionId: "native" };
+      },
+    };
+    expect(await requests.reload(input)).toEqual({ status: "outcome_unknown" });
+    if (scenario === "receipt_failure") {
+      await expect(new MessageReceipts(directory).reload(input)).rejects.toThrow();
+    } else {
+      expect(await new MessageReceipts(directory).reload(input)).toEqual({
+        status: "outcome_unknown",
+      });
+    }
+    expect(reloads).toBe(1);
+  },
+);
+
+test("reload receipt scope is captured before caller mutation", async () => {
+  const { requests } = await fixture();
+  const original = { model: "gpt-6.1-sol" };
+  const input = {
+    agentId: "worker",
+    operationId: "captured",
+    request: { ...original },
+    reload: async () => ({ status: "reloaded" as const, sessionId: "native" }),
+  };
+  const pending = requests.reload(input);
+  input.request.model = "changed";
+  await pending;
+  expect(await requests.reload({ ...input, request: original })).toEqual({
+    status: "reloaded",
+    sessionId: "native",
+  });
+  expect(await requests.reload(input)).toEqual({
+    status: "rejected",
+    reason: "operation_id_conflict",
+  });
+});
+
+test("reload and message admission retain separate durable operation identities", async () => {
+  const { requests, directory } = await fixture();
+  let reloads = 0;
+  let messages = 0;
+  const reload = {
+    agentId: "worker",
+    operationId: "same-id",
+    request: { first: 1, second: 2 },
+    reload: async () => {
+      reloads++;
+      return { status: "reloaded" as const, sessionId: "native" };
+    },
+  };
+  const message = {
+    agentId: "worker",
+    messageId: "same-id",
+    request: { first: 1, second: 2 },
+    admit: async () => {
+      messages++;
+      return { status: "accepted" as const, turnId: "next-turn" };
+    },
+  };
+  await Promise.all([requests.reload(reload), requests.admit(message)]);
+  const restarted = new MessageReceipts(directory);
+  expect(await restarted.reload({ ...reload, request: { second: 2, first: 1 } })).toEqual({
+    status: "reloaded",
+    sessionId: "native",
+  });
+  expect(await restarted.admit(message)).toEqual({ status: "accepted", turnId: "next-turn" });
+  expect({ reloads, messages }).toEqual({ reloads: 1, messages: 1 });
 });

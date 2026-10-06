@@ -4,23 +4,33 @@ import path from "node:path";
 import { z } from "zod";
 import {
   AgentMessageAdmissionResultSchema,
+  AgentReloadAdmissionResultSchema,
   type AgentMessageAdmissionResult,
+  type AgentReloadAdmissionResult,
 } from "@getpaseo/protocol/messages";
 
-const AdmissionReceiptSchema = z.discriminatedUnion("state", [
-  z.object({ state: z.literal("pending"), fingerprint: z.string(), agentId: z.string() }),
-  z.object({
-    state: z.literal("resolved"),
-    fingerprint: z.string(),
-    agentId: z.string(),
-    result: AgentMessageAdmissionResultSchema,
-  }),
-]);
+function admissionReceiptSchema<T>(resultSchema: z.ZodType<T>) {
+  return z.discriminatedUnion("state", [
+    z.object({ state: z.literal("pending"), fingerprint: z.string(), agentId: z.string() }),
+    z.object({
+      state: z.literal("resolved"),
+      fingerprint: z.string(),
+      agentId: z.string(),
+      result: resultSchema,
+    }),
+  ]);
+}
 interface AdmitMessageInput {
   agentId: string;
   messageId: string;
   request: unknown;
   admit: () => Promise<AgentMessageAdmissionResult>;
+}
+interface AdmitReloadInput {
+  agentId: string;
+  operationId: string;
+  request: unknown;
+  reload: () => Promise<AgentReloadAdmissionResult>;
 }
 import { writeJsonFileAtomic } from "../atomic-file.js";
 
@@ -37,56 +47,90 @@ interface SendMessageInput {
   prepare?: () => Promise<void>;
 }
 
-/** Owns message delivery receipts; creation is owned by CreationService. */
+/** Owns resident-agent operation receipts; creation is owned by CreationService. */
 export class MessageReceipts {
   private readonly pending = new Map<string, Promise<void>>();
   private readonly admissions = new Map<string, Promise<AgentMessageAdmissionResult>>();
+  private readonly reloads = new Map<string, Promise<AgentReloadAdmissionResult>>();
   constructor(private readonly directory: string) {}
 
   admit(input: AdmitMessageInput): Promise<AgentMessageAdmissionResult> {
     const key = digest(["admit", input.agentId, input.messageId]);
-    const previous = this.admissions.get(key);
-    const result = (previous ? previous.catch(() => undefined) : Promise.resolve()).then(() =>
-      this.admitOnce(key, input),
+    return this.serializeAdmission(key, this.admissions, () =>
+      this.admitOnce(
+        key,
+        input,
+        AgentMessageAdmissionResultSchema,
+        { status: "rejected", reason: "message_id_conflict" },
+        { status: "outcome_unknown" },
+      ),
     );
-    this.admissions.set(key, result);
+  }
+
+  reload(input: AdmitReloadInput): Promise<AgentReloadAdmissionResult> {
+    const captured = { ...input, request: structuredClone(input.request) };
+    const key = digest(["reload", captured.agentId, captured.operationId]);
+    return this.serializeAdmission(key, this.reloads, () =>
+      this.admitOnce(
+        key,
+        { ...captured, admit: captured.reload },
+        AgentReloadAdmissionResultSchema,
+        { status: "rejected", reason: "operation_id_conflict" },
+        { status: "outcome_unknown" },
+      ),
+    );
+  }
+
+  private serializeAdmission<T>(
+    key: string,
+    pending: Map<string, Promise<T>>,
+    admit: () => Promise<T>,
+  ): Promise<T> {
+    const previous = pending.get(key);
+    const result = (previous ? previous.catch(() => undefined) : Promise.resolve()).then(() =>
+      admit(),
+    );
+    pending.set(key, result);
     void result
       .finally(() => {
-        if (this.admissions.get(key) === result) this.admissions.delete(key);
+        if (pending.get(key) === result) pending.delete(key);
       })
       .catch(() => undefined);
     return result;
   }
 
-  private async admitOnce(
+  private async admitOnce<T>(
     key: string,
-    input: AdmitMessageInput,
-  ): Promise<AgentMessageAdmissionResult> {
+    input: { agentId: string; request: unknown; admit: () => Promise<T> },
+    resultSchema: z.ZodType<T>,
+    conflict: T,
+    unknown: T,
+  ): Promise<T> {
     const file = path.join(this.directory, `${key}.json`);
     const fingerprint = digest(input.request);
-    let existing: z.infer<typeof AdmissionReceiptSchema> | null;
+    const receiptSchema = admissionReceiptSchema(resultSchema);
+    let existing: z.infer<typeof receiptSchema> | null;
     try {
-      existing = AdmissionReceiptSchema.parse(JSON.parse(await readFile(file, "utf8")));
+      existing = receiptSchema.parse(JSON.parse(await readFile(file, "utf8")));
     } catch (error) {
       if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
       existing = null;
     }
     if (existing) {
-      if (existing.fingerprint !== fingerprint)
-        return { status: "rejected", reason: "message_id_conflict" };
-      return existing.state === "resolved" ? existing.result : { status: "outcome_unknown" };
+      if (existing.fingerprint !== fingerprint) return conflict;
+      return existing.state === "resolved" ? existing.result : unknown;
     }
     const receipt = { fingerprint, agentId: input.agentId };
     // Persist uncertainty before touching the provider. Rejection is a terminal
     // result too: a later attempt needs a new id and fresh preconditions.
     await writeJsonFileAtomic(file, { ...receipt, state: "pending" });
     try {
-      const result = await input.admit();
+      const result = resultSchema.parse(await input.admit());
       await writeJsonFileAtomic(file, { ...receipt, state: "resolved", result });
       return result;
     } catch {
       // Neither provider failure nor failure to persist acceptance authorizes replay.
-      return { status: "outcome_unknown" };
+      return unknown;
     }
   }
 
