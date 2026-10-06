@@ -272,6 +272,58 @@ interface CodexAppServerHomeReceipt {
   launch: CodexAppServerLaunchReceipt | null;
 }
 
+function projectCodexRuntimeConfig(
+  config: Record<string, unknown>,
+): Record<string, unknown> | null {
+  if (
+    typeof config.model !== "string" ||
+    !config.model.trim() ||
+    typeof config.model_reasoning_effort !== "string" ||
+    !config.model_reasoning_effort.trim()
+  )
+    return null;
+  const projection: Record<string, unknown> = {};
+  for (const key of [
+    "model",
+    "model_provider",
+    "model_reasoning_effort",
+    "approval_policy",
+    "sandbox_mode",
+  ]) {
+    const value = config[key];
+    if (typeof value === "string" || value === null) projection[key] = value;
+  }
+  const agents = toObjectRecord(config.agents);
+  if (agents) {
+    const selected: Record<string, unknown> = {};
+    if (typeof agents.enabled === "boolean") selected.enabled = agents.enabled;
+    if (Number.isInteger(agents.max_concurrent_threads_per_session))
+      selected.max_concurrent_threads_per_session = agents.max_concurrent_threads_per_session;
+    projection.agents = selected;
+  }
+  for (const group of ["features", "mcp_servers", "plugins", "apps"]) {
+    if (config[group] === undefined) continue;
+    const record = toObjectRecord(config[group]);
+    if (!record) return null;
+    const entries = Object.entries(record);
+    if (entries.length > 256 || entries.some(([key]) => key.length > 256)) return null;
+    if (group === "features") {
+      projection[group] = Object.fromEntries(
+        entries.filter(([, value]) => typeof value === "boolean"),
+      );
+    } else {
+      const selected: Array<[string, { enabled: boolean }]> = [];
+      for (const [key, value] of entries) {
+        const state = toObjectRecord(value);
+        if (!state) return null;
+        selected.push([key, { enabled: state.enabled !== false }]);
+      }
+      projection[group] = Object.fromEntries(selected);
+    }
+  }
+  return projection;
+}
+
 async function readCodexLaunchFile(
   filePath: string,
   maxBytes: number,
@@ -3494,6 +3546,8 @@ export class CodexAppServerAgentSession implements AgentSession {
   private resolvedThreadConfiguration: Record<string, unknown> | null = null;
   private runtimeAccountObservation: Record<string, unknown> | null = null;
   private runtimeAccountClient: CodexAppServerClientLike | null = null;
+  private runtimeEffectiveConfigObservation: Record<string, unknown> | null = null;
+  private runtimeEffectiveConfigClient: CodexAppServerClientLike | null = null;
   private runtimeHomeReceipt: CodexAppServerHomeReceipt | null = null;
   private runtimeHomeObservation: Record<string, unknown> | null = null;
   private runtimeLaunchObservation: Record<string, unknown> | null = null;
@@ -3773,6 +3827,8 @@ export class CodexAppServerAgentSession implements AgentSession {
     // inherits account identity from environment or another App Server process.
     this.runtimeAccountObservation = null;
     this.runtimeAccountClient = null;
+    this.runtimeEffectiveConfigObservation = null;
+    this.runtimeEffectiveConfigClient = null;
     const client = this.client;
     const threadId = this.currentThreadId;
     const acceptedRequest = this.acceptedTurnRequest;
@@ -3815,9 +3871,29 @@ export class CodexAppServerAgentSession implements AgentSession {
         workspaceIdentityStatus: workspace ? "VERIFIED" : "UNAVAILABLE",
         accountType: principal.type,
       };
+      this.rememberRuntimeEffectiveConfig(config, client, acceptedRequest, threadId);
     } catch {
       this.logger.debug("Native Codex account readback unavailable");
     }
+  }
+
+  private rememberRuntimeEffectiveConfig(
+    config: Record<string, unknown>,
+    client: CodexAppServerClientLike,
+    acceptedRequest: Record<string, string | null> | null,
+    threadId: string | null,
+  ): void {
+    const projection = projectCodexRuntimeConfig(config);
+    if (!projection || !acceptedRequest || acceptedRequest.sessionId !== threadId) return;
+    this.runtimeEffectiveConfigClient = client;
+    this.runtimeEffectiveConfigObservation = {
+      source: "native-session-app-server-config-read",
+      observedAt: new Date().toISOString(),
+      sessionId: acceptedRequest.sessionId,
+      nativeTurnId: acceptedRequest.nativeTurnId,
+      cwd: this.config.cwd ?? null,
+      config: projection,
+    };
   }
 
   private rememberResolvedSandboxPolicy(response: unknown): void {
@@ -4869,6 +4945,17 @@ export class CodexAppServerAgentSession implements AgentSession {
           sessionId: this.acceptedTurnRequest.sessionId,
           nativeTurnId: this.acceptedTurnRequest.nativeTurnId,
         };
+      }
+      if (
+        this.runtimeEffectiveConfigObservation &&
+        this.runtimeEffectiveConfigClient === this.client &&
+        this.runtimeEffectiveConfigObservation.sessionId === this.acceptedTurnRequest.sessionId &&
+        this.runtimeEffectiveConfigObservation.nativeTurnId ===
+          this.acceptedTurnRequest.nativeTurnId
+      ) {
+        extra.runtimeEffectiveConfigObservation = structuredClone(
+          this.runtimeEffectiveConfigObservation,
+        );
       }
     }
     if (

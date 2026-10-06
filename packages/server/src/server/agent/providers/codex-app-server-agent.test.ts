@@ -976,6 +976,122 @@ describe("Codex app-server provider", () => {
     expect(request).not.toHaveBeenCalled();
   });
 
+  test("effective configuration uses native readback and exposes only qualification settings", async () => {
+    const session = createSession();
+    session.activeForegroundTurnId = null;
+    let config: Record<string, unknown> = {
+      model: "gpt-6-luna",
+      model_reasoning_effort: "medium",
+      model_provider: "openai",
+      approval_policy: "never",
+      sandbox_mode: "workspace-write",
+      agents: { enabled: true, max_concurrent_threads_per_session: 1, private: "secret" },
+      features: { goals: true, private: "secret" },
+      mcp_servers: { governed: { enabled: false, command: "secret", env: { TOKEN: "secret" } } },
+      plugins: { owned: {} },
+      apps: {},
+      api_key: "secret",
+    };
+    let failRead = false;
+    const request = vi.fn(async (method: string) => {
+      if (method === "thread/loaded/list") return { data: ["test-thread"] };
+      if (method === "turn/start") return { turn: { id: "config-native-turn" } };
+      if (method === "account/read")
+        return { account: { type: "chatgpt", email: "fixture@example.invalid" } };
+      if (method === "config/read") {
+        if (failRead) throw new Error("fixture read unavailable");
+        return { config };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    session.client = { request };
+    await session.startTurn("owned bootstrap");
+    await session.getRuntimeInfo();
+    const info = await session.refreshRuntimeInfo!();
+    expect(info.extra?.runtimeEffectiveConfigObservation).toMatchObject({
+      source: "native-session-app-server-config-read",
+      sessionId: "test-thread",
+      nativeTurnId: "config-native-turn",
+      config: {
+        model: "gpt-6-luna",
+        model_reasoning_effort: "medium",
+        agents: { enabled: true, max_concurrent_threads_per_session: 1 },
+        features: { goals: true },
+        mcp_servers: { governed: { enabled: false } },
+        plugins: { owned: { enabled: true } },
+        apps: {},
+      },
+    });
+    expect(JSON.stringify(info.extra?.runtimeEffectiveConfigObservation)).not.toContain("secret");
+    const exposed = info.extra?.runtimeEffectiveConfigObservation as {
+      config: Record<string, unknown>;
+    };
+    exposed.config.model = "forged";
+    expect((await session.getRuntimeInfo()).extra?.runtimeEffectiveConfigObservation).toMatchObject(
+      { config: { model: "gpt-6-luna" } },
+    );
+    request.mockClear();
+    const refreshed = await session.refreshRuntimeInfo!();
+    expect(request.mock.calls.map(([method]) => method)).toEqual(["account/read", "config/read"]);
+    expect(refreshed.extra?.runtimeEffectiveConfigObservation).toMatchObject({
+      config: { model: "gpt-6-luna" },
+    });
+    config = { ...config, model: "gpt-6.1-sol", model_reasoning_effort: "high" };
+    expect(
+      (await session.refreshRuntimeInfo!()).extra?.runtimeEffectiveConfigObservation,
+    ).toMatchObject({
+      config: { model: "gpt-6.1-sol", model_reasoning_effort: "high" },
+    });
+    failRead = true;
+    expect(
+      (await session.refreshRuntimeInfo!()).extra?.runtimeEffectiveConfigObservation,
+    ).toBeUndefined();
+    failRead = false;
+    await session.refreshRuntimeInfo!();
+    session.acceptedTurnRequest = {
+      ...session.acceptedTurnRequest,
+      nativeTurnId: "replacement-turn",
+    };
+    expect(
+      (await session.getRuntimeInfo()).extra?.runtimeEffectiveConfigObservation,
+    ).toBeUndefined();
+    session.acceptedTurnRequest.nativeTurnId = "config-native-turn";
+    session.client = { request };
+    expect(
+      (await session.getRuntimeInfo()).extra?.runtimeEffectiveConfigObservation,
+    ).toBeUndefined();
+  });
+
+  test.each([
+    {},
+    { model: "gpt-6-luna" },
+    { model: "gpt-6-luna", model_reasoning_effort: "medium", mcp_servers: [] },
+    { model: "gpt-6-luna", model_reasoning_effort: "medium", plugins: { bad: "value" } },
+    {
+      model: "gpt-6-luna",
+      model_reasoning_effort: "medium",
+      features: Object.fromEntries(Array.from({ length: 257 }, (_, i) => [`feature-${i}`, true])),
+    },
+  ])("partial or malformed effective configuration produces no observation: %j", async (config) => {
+    const session = createSession();
+    session.activeForegroundTurnId = null;
+    session.client = {
+      request: vi.fn(async (method: string) => {
+        if (method === "thread/loaded/list") return { data: ["test-thread"] };
+        if (method === "turn/start") return { turn: { id: "config-native-turn" } };
+        if (method === "account/read")
+          return { account: { type: "chatgpt", email: "fixture@example.invalid" } };
+        if (method === "config/read") return { config };
+        throw new Error(`Unexpected request: ${method}`);
+      }),
+    };
+    await session.startTurn("owned bootstrap");
+    await session.getRuntimeInfo();
+    expect(
+      (await session.refreshRuntimeInfo!()).extra?.runtimeEffectiveConfigObservation,
+    ).toBeUndefined();
+  });
+
   test.each(["session", "connection"])(
     "runtime refresh rejects %s replacement during the native read",
     async (replacement) => {
