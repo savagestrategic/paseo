@@ -14,6 +14,7 @@ import {
   type ManagedAgent,
 } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
+import { MessageReceipts } from "../message-receipts/index.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { toAgentPayload } from "./agent-projections.js";
 import { projectTimelineRows } from "./timeline-projection.js";
@@ -11627,9 +11628,20 @@ async function guardedReloadFixture() {
       );
     }
   })();
-  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    providerDefinitions: { codex: { enabled: true, validateOptions: (options) => options } },
+  });
   const agent = await manager.createAgent(
-    { provider: "codex", cwd: workdir, model: "gpt-6-luna", thinkingOptionId: "medium" },
+    {
+      provider: "codex",
+      cwd: workdir,
+      model: "gpt-6-luna",
+      thinkingOptionId: "medium",
+      providerOptions: { fixtureRetainedOption: "original" },
+    },
     undefined,
     { workspaceId: undefined },
   );
@@ -11747,6 +11759,125 @@ test.each(["stable", "revoked", "identity"])(
     }
   },
 );
+
+test("durable reload retains an explicit pre-effect refusal across reconstruction", async () => {
+  const f = await guardedReloadFixture();
+  try {
+    const directory = join(f.agent.cwd, "operation-receipts");
+    const input = {
+      agentId: f.agent.id,
+      operationId: "refused",
+      request: { expected: f.admission.expected, model: "gpt-6.1-sol" },
+      reload: () =>
+        f.manager.admitAgentReload({
+          ...f.admission,
+          agentId: f.agent.id,
+          model: "gpt-6.1-sol",
+          thinkingOptionId: "medium",
+          authorize: () => false,
+        }),
+    };
+    expect(await new MessageReceipts(directory).reload(input)).toEqual({
+      status: "rejected",
+      reason: "not_authorized",
+    });
+    expect(await new MessageReceipts(directory).reload(input)).toEqual({
+      status: "rejected",
+      reason: "not_authorized",
+    });
+    expect(f.effects()).toEqual({ closes: 0, resumes: 0, replacementClosed: false });
+    expect(f.manager.getAgent(f.agent.id)?.config.model).toBe("gpt-6-luna");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test.each(["stable", "revoked", "identity"])(
+  "durable guarded reload keeps one provider effect through %s and reconstruction",
+  async (scenario) => {
+    const f = await guardedReloadFixture();
+    const directory = join(f.agent.cwd, "operation-receipts");
+    const receipts = new MessageReceipts(directory);
+    let authorized = true;
+    f.client.changeResumeIdentity = scenario === "identity";
+    const input = {
+      agentId: f.agent.id,
+      operationId: "escalation",
+      request: { expected: f.admission.expected, model: "gpt-6.1-sol", thinkingOptionId: "medium" },
+      reload: () =>
+        f.manager.admitAgentReload({
+          ...f.admission,
+          agentId: f.agent.id,
+          model: "gpt-6.1-sol",
+          thinkingOptionId: "medium",
+          authorize: () => authorized,
+          appServerArgs: ["--strict-config"],
+        }),
+    };
+    const original = receipts.reload(input);
+    const duplicate = receipts.reload(input);
+    try {
+      await f.closeStarted.promise;
+      expect(await new MessageReceipts(directory).reload(input)).toEqual({
+        status: "outcome_unknown",
+      });
+      if (scenario === "revoked") authorized = false;
+      f.closeAllowed.resolve();
+      const result =
+        scenario === "stable"
+          ? { status: "reloaded", sessionId: f.agent.persistence!.sessionId }
+          : { status: "outcome_unknown" };
+      expect(await original).toEqual(result);
+      expect(await duplicate).toEqual(result);
+      expect(await new MessageReceipts(directory).reload(input)).toEqual(result);
+      expect(f.effects()).toEqual({
+        closes: 1,
+        resumes: scenario === "revoked" ? 0 : 1,
+        replacementClosed: scenario === "identity",
+      });
+      if (scenario !== "revoked") {
+        expect(f.client.resumeOverrides[0]?.providerOptions).toEqual({
+          fixtureRetainedOption: "original",
+          appServerArgs: ["--strict-config"],
+        });
+      }
+    } finally {
+      f.closeAllowed.resolve();
+      await Promise.all([original, duplicate]);
+      await f.cleanup();
+    }
+  },
+);
+
+test("guarded reload classifies missing, closed and archived recipients without hydration", async () => {
+  const f = await guardedReloadFixture();
+  const input = {
+    ...f.admission,
+    agentId: f.agent.id,
+    model: "gpt-6.1-sol",
+    thinkingOptionId: "medium",
+  };
+  try {
+    expect(await f.manager.admitAgentReload({ ...input, agentId: randomUUID() })).toEqual({
+      status: "rejected",
+      reason: "not_found",
+    });
+    f.closeAllowed.resolve();
+    await f.manager.closeAgent(f.agent.id);
+    expect(await f.manager.admitAgentReload(input)).toEqual({
+      status: "rejected",
+      reason: "not_idle",
+    });
+    await f.manager.archiveSnapshot(f.agent.id, new Date().toISOString());
+    expect(await f.manager.admitAgentReload(input)).toEqual({
+      status: "rejected",
+      reason: "archived",
+    });
+    expect(f.effects()).toEqual({ closes: 1, resumes: 0, replacementClosed: false });
+  } finally {
+    await f.cleanup();
+  }
+});
 
 test("conditional native message preserves identity and accepts a resident idle turn", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "conditional-admission-"));

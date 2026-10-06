@@ -1,6 +1,7 @@
 import type {
   AdmitAgentMessageRequest,
   AgentMessageAdmissionResult,
+  AgentReloadAdmissionResult,
 } from "@getpaseo/protocol/messages";
 import { projectTimelineRows } from "./timeline-projection.js";
 import type { PluginLifecycle } from "../plugins/lifecycle/index.js";
@@ -735,7 +736,26 @@ export interface AgentReloadOptions {
     expectedNativeTurnId: string;
     expiresAt: string;
     authorize: () => boolean;
+    onCloseStarted?: () => void;
   };
+}
+
+class ReloadAdmissionRejected extends Error {
+  constructor(
+    readonly reason: Extract<AgentReloadAdmissionResult, { status: "rejected" }>["reason"],
+  ) {
+    super(`Reload admission: ${reason}`);
+  }
+}
+
+export interface AgentReloadAdmissionInput extends Omit<
+  NonNullable<AgentReloadOptions["admission"]>,
+  "onCloseStarted"
+> {
+  agentId: string;
+  model: string;
+  thinkingOptionId: string;
+  appServerArgs?: string[];
 }
 
 export class AgentManager {
@@ -1584,14 +1604,54 @@ export class AgentManager {
     );
   }
 
+  /** Receipt owners call this once after persisting pending operation state. */
+  async admitAgentReload(input: AgentReloadAdmissionInput): Promise<AgentReloadAdmissionResult> {
+    const expectedSessionId = input.expected.sessionId;
+    if (
+      input.expected.provider !== "codex" ||
+      !input.model.trim() ||
+      !input.thinkingOptionId.trim()
+    )
+      return { status: "rejected", reason: "scope_changed" };
+    let closeStarted = false;
+    try {
+      const overrides: Partial<AgentSessionConfig> = {
+        model: input.model,
+        thinkingOptionId: input.thinkingOptionId,
+      };
+      if (input.appServerArgs !== undefined)
+        overrides.providerOptions = { appServerArgs: input.appServerArgs };
+      const agent = await this.reloadAgentSession(input.agentId, overrides, {
+        admission: {
+          expected: input.expected,
+          expectedNativeTurnId: input.expectedNativeTurnId,
+          expiresAt: input.expiresAt,
+          authorize: input.authorize,
+          onCloseStarted: () => {
+            closeStarted = true;
+          },
+        },
+      });
+      const sessionId = agent.persistence?.sessionId;
+      return sessionId === expectedSessionId
+        ? { status: "reloaded", sessionId }
+        : { status: "outcome_unknown" };
+    } catch (error) {
+      // A refusal after close begins cannot prove the original writer survived.
+      if (!closeStarted && error instanceof ReloadAdmissionRejected)
+        return { status: "rejected", reason: error.reason };
+      return { status: "outcome_unknown" };
+    }
+  }
+
   private async reloadAgentSessionInternal(
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
     options?: AgentReloadOptions,
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
-    let existing = this.requireSessionAgent(agentId);
     await this.prepareReloadAdmission(agentId, options);
+    let existing = this.requireReloadSession(agentId, options);
     this.assertReloadAdmission(existing, options);
     if (this.hasInFlightRun(agentId)) {
       await this.cancelAgentRunBefore(agentId, "reload");
@@ -1605,11 +1665,7 @@ export class AgentManager {
     const handle = existing.persistence;
     const provider = handle?.provider ?? existing.provider;
     const client = this.requireClient(provider);
-    const refreshConfig = {
-      ...existing.config,
-      ...overrides,
-      provider,
-    } as AgentSessionConfig;
+    const refreshConfig = this.buildReloadConfig(existing.config, overrides, provider, options);
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
       refreshConfig,
       agentId,
@@ -1640,6 +1696,7 @@ export class AgentManager {
     this.assertReloadAdmission(existing, options);
     try {
       // A persisted thread can have only one writer, even when its turn is idle.
+      this.markReloadCloseStarted(options);
       await this.closeReloadedSession(existing.session, agentId);
       await this.drainSessionEvents(agentId);
       this.cancelRunningProviderSubagents(agentId);
@@ -1706,14 +1763,32 @@ export class AgentManager {
     }
   }
 
+  private buildReloadConfig(
+    config: AgentSessionConfig,
+    overrides: Partial<AgentSessionConfig> | undefined,
+    provider: AgentProvider,
+    options?: AgentReloadOptions,
+  ): AgentSessionConfig {
+    const refreshed = { ...config, ...overrides, provider };
+    if (options?.admission && overrides?.providerOptions) {
+      // A launch-argument update must retain the other saved provider options.
+      refreshed.providerOptions = { ...config.providerOptions, ...overrides.providerOptions };
+    }
+    return refreshed;
+  }
+
+  private markReloadCloseStarted(options?: AgentReloadOptions): void {
+    options?.admission?.onCloseStarted?.();
+  }
+
   private async prepareReloadAdmission(
     agentId: string,
     options?: AgentReloadOptions,
   ): Promise<void> {
     if (!options?.admission) return;
     const record = await this.requireRegistry().get(agentId);
-    if (!record) throw new Error("Reload admission: not_found");
-    if (record.archivedAt) throw new Error("Reload admission: archived");
+    if (!record) throw new ReloadAdmissionRejected("not_found");
+    if (record.archivedAt) throw new ReloadAdmissionRejected("archived");
     await this.drainSessionEvents(agentId);
     this.agentStreamCoalescer.flushFor(agentId);
   }
@@ -1731,13 +1806,20 @@ export class AgentManager {
     }
   }
 
+  private requireReloadSession(agentId: string, options?: AgentReloadOptions): ActiveManagedAgent {
+    const agent = this.agents.get(agentId);
+    if (options?.admission && (!agent || agent.session === null))
+      throw new ReloadAdmissionRejected("not_idle");
+    return this.requireSessionAgent(agentId);
+  }
+
   private assertReloadAuthority(options?: AgentReloadOptions): void {
     const admission = options?.admission;
     if (!admission) return;
     const deadline = Date.parse(admission.expiresAt);
     if (!Number.isFinite(deadline) || deadline <= Date.now())
-      throw new Error("Reload admission: expired");
-    if (!admission.authorize()) throw new Error("Reload admission: not_authorized");
+      throw new ReloadAdmissionRejected("expired");
+    if (!admission.authorize()) throw new ReloadAdmissionRejected("not_authorized");
   }
 
   private assertReloadAdmission(agent: ActiveManagedAgent, options?: AgentReloadOptions): void {
@@ -1745,16 +1827,16 @@ export class AgentManager {
     if (!admission) return;
     if (options.rehydrateFromDisk) throw new Error("Reload admission cannot replace history");
     if (this.agents.get(agent.id) !== agent || agent.lifecycle !== "idle")
-      throw new Error("Reload admission: not_idle");
+      throw new ReloadAdmissionRejected("not_idle");
     if (agent.pendingPermissions.size || agent.inFlightPermissionResponses.size)
-      throw new Error("Reload admission: permission_pending");
+      throw new ReloadAdmissionRejected("permission_pending");
     if (this.hasInFlightRun(agent.id) || agent.activeTurnId || agent.pendingReplacement)
-      throw new Error("Reload admission: busy");
+      throw new ReloadAdmissionRejected("busy");
     if (
       !this.matchesMessageAdmissionScope(agent, admission.expected) ||
       !this.matchesReloadNativeTurn(agent, admission)
     ) {
-      throw new Error("Reload admission: scope_changed");
+      throw new ReloadAdmissionRejected("scope_changed");
     }
     this.assertReloadAuthority(options);
   }
