@@ -635,7 +635,7 @@ async function withCustomCodexProviderHome<T>(
     readCaptured: () => CapturedFakeCodexRecord[];
     launchExecutable: string;
   }) => Promise<T>,
-  options: { copyExecutable?: boolean; config?: string } = {},
+  options: { copyExecutable?: boolean; config?: string; appServerArgs?: unknown } = {},
 ): Promise<T> {
   const tempDir = await mkdtemp(path.join(tmpdir(), "codex-provider-home-"));
   const daemonCodexHome = path.join(tempDir, "daemon-codex-home");
@@ -660,7 +660,7 @@ const fs = require("node:fs");
 const capturePath = process.env.PASEO_FAKE_CODEX_CAPTURE;
 let buffer = "";
 
-fs.appendFileSync(capturePath, JSON.stringify({ kind: "env", CODEX_HOME: process.env.CODEX_HOME }) + "\\n");
+fs.appendFileSync(capturePath, JSON.stringify({ kind: "env", CODEX_HOME: process.env.CODEX_HOME, argv: process.argv.slice(1) }) + "\\n");
 
 function resultFor(method) {
   if (method === "collaborationMode/list") return { data: [] };
@@ -701,6 +701,7 @@ process.stdin.on("data", (chunk) => {
         extends: "codex",
         label: "Profile Codex",
         command: [launchExecutable, fakeAppServerPath],
+        params: { appServerArgs: options.appServerArgs },
         env: {
           CODEX_HOME: providerCodexHome,
           PASEO_FAKE_CODEX_CAPTURE: capturedRequestsPath,
@@ -708,13 +709,13 @@ process.stdin.on("data", (chunk) => {
       },
     },
   });
-  const session = await registry["profile-codex"].createClient(createTestLogger()).createSession({
-    provider: "profile-codex",
-    cwd: tempDir,
-    modeId: "auto",
-  });
-
+  let session: AgentSession | null = null;
   try {
+    session = await registry["profile-codex"].createClient(createTestLogger()).createSession({
+      provider: "profile-codex",
+      cwd: tempDir,
+      modeId: "auto",
+    });
     return await run({
       session,
       launchExecutable,
@@ -725,7 +726,7 @@ process.stdin.on("data", (chunk) => {
           .map((line) => JSON.parse(line) as CapturedFakeCodexRecord),
     });
   } finally {
-    await session.close();
+    await session?.close();
     vi.unstubAllEnvs();
     rmSync(tempDir, { recursive: true, force: true });
   }
@@ -1066,6 +1067,41 @@ describe("Codex app-server provider", () => {
       );
     });
   });
+
+  test("configured app-server arguments reach the maintained registry launch and observed argv digest", async () => {
+    const args = ["--strict-config", "--stdio", '--config=model="gpt-6-luna"'];
+    await withCustomCodexProviderHome(
+      async ({ session, readCaptured }) => {
+        await session.startTurn("owned configured launch");
+        const argv = readCaptured()[0]?.argv;
+        expect(Array.isArray(argv)).toBe(true);
+        const launched = argv as string[];
+        expect(launched.slice(1)).toEqual(["app-server", ...args, "--enable", "goals"]);
+        expect((await session.getRuntimeInfo()).extra?.runtimeLaunchObservation).toHaveProperty(
+          "argvSha256",
+          createHash("sha256").update(JSON.stringify(launched)).digest("hex"),
+        );
+      },
+      { appServerArgs: args },
+    );
+  });
+
+  test.each([
+    ["not an array", "--stdio"],
+    ["remote transport", ["--listen=ws://localhost:1234"]],
+    ["empty config", ["--config="]],
+    ["non-string", [42]],
+    ["argument count", Array(129).fill("--stdio")],
+    ["argument bytes", ["--config=x=" + "é".repeat(8192)]],
+    ["total bytes", Array(5).fill("--config=x=" + "a".repeat(16000))],
+  ])(
+    "invalid configured app-server arguments refuse provider launch: %s",
+    async (_name, appServerArgs) => {
+      await expect(
+        withCustomCodexProviderHome(async () => undefined, { appServerArgs }),
+      ).rejects.toThrow("Codex params.appServerArgs");
+    },
+  );
 
   test("launch evidence refuses a replaced executable even with identical bytes", async () => {
     await withCustomCodexProviderHome(

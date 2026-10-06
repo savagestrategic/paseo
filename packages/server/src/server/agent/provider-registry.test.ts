@@ -153,9 +153,16 @@ vi.mock("./providers/codex-app-server-agent.js", () => ({
     readonly provider = "codex";
     readonly runtimeSettings?: unknown;
 
-    constructor(_logger: unknown, runtimeSettings?: unknown) {
+    constructor(
+      _logger: unknown,
+      runtimeSettings?: unknown,
+      options?: { providerParams?: unknown },
+    ) {
       this.runtimeSettings = runtimeSettings;
-      mockState.constructorArgs.codex.push({ runtimeSettings });
+      mockState.constructorArgs.codex.push({
+        runtimeSettings,
+        providerParams: options?.providerParams,
+      });
     }
 
     async createSession(): Promise<never> {
@@ -569,6 +576,23 @@ test("includes mock provider only for development builds", () => {
     defaultModeId: "load-test",
   });
 });
+
+test.each(["codex", "owned-codex"])(
+  "Codex provider parameters reach the maintained factory: %s",
+  (provider) => {
+    const params = { appServerArgs: ["--strict-config", "--stdio", '--config=model="gpt-6-luna"'] };
+    const registry = buildProviderRegistry(logger, {
+      providerOverrides: {
+        [provider]: {
+          ...(provider === "codex" ? {} : { extends: "codex", label: "Owned Codex" }),
+          params,
+        },
+      },
+    });
+    registry[provider].createClient(logger);
+    expect(mockState.constructorArgs.codex.at(-1)?.providerParams).toEqual(params);
+  },
+);
 
 test("built-in override applies command", () => {
   buildProviderRegistry(logger, {

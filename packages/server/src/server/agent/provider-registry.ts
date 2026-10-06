@@ -203,6 +203,7 @@ const PROVIDER_CLIENT_FACTORIES: Record<string, ProviderClientFactory> = {
     new CodexAppServerAgentClient(logger, runtimeSettings, {
       workspaceGitService: options?.workspaceGitService,
       customProvider: options?.customProvider,
+      providerParams: options?.providerParams,
     }),
   copilot: (logger, runtimeSettings) =>
     new CopilotACPAgentClient({

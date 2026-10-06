@@ -345,6 +345,37 @@ Override the command used to launch any provider with the `command` field. This 
 }
 ```
 
+### Codex app-server arguments
+
+For Codex, `params.appServerArgs` adds arguments after the `app-server` subcommand.
+Use it for `--strict-config`, `--stdio`, and `--config=<key>=<value>` overrides.
+`command` remains the executable prefix. Other transport or remote-host arguments
+are rejected. Limits are 128 arguments, 16 KiB per argument and 64 KiB total.
+
+```json
+{
+  "agents": {
+    "providers": {
+      "codex": {
+        "params": {
+          "appServerArgs": [
+            "--strict-config",
+            "--stdio",
+            "--config=model=\"gpt-6-luna\"",
+            "--config=model_reasoning_effort=\"medium\""
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+These launch settings do not commission a runtime or establish effective turn
+permissions. Native launch evidence records the complete actual argument digest,
+including any automatically enabled Goals feature; a governed consumer must
+compare it to its authorized launch contract.
+
 ### Custom binary on a derived provider
 
 ```json

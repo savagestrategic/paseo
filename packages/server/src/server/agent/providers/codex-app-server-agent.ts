@@ -355,6 +355,7 @@ async function readCodexHomeFingerprint(homePath: string): Promise<string> {
 }
 
 interface CodexAppServerAgentDeps {
+  providerParams?: unknown;
   workspaceGitService?: Pick<WorkspaceGitService, "resolveRepoRoot">;
   customProvider?: {
     id: string;
@@ -7436,6 +7437,32 @@ export class CodexAppServerAgentClient implements AgentClient {
     return buildCodexCustomProviderConfig(this.runtimeSettings, this.deps.customProvider);
   }
 
+  private appServerArgs(): string[] {
+    const params = toObjectRecord(this.deps.providerParams);
+    const value = params?.appServerArgs;
+    if (value === undefined) return [];
+    if (
+      !Array.isArray(value) ||
+      value.length > 128 ||
+      value.some(
+        (argument) =>
+          typeof argument !== "string" ||
+          Buffer.byteLength(argument, "utf8") > 16384 ||
+          !(
+            argument === "--strict-config" ||
+            argument === "--stdio" ||
+            (argument.startsWith("--config=") && argument.length > 9)
+          ),
+      )
+    ) {
+      throw new Error("Codex params.appServerArgs must contain bounded config or stdio arguments");
+    }
+    const args = value as string[];
+    if (Buffer.byteLength(args.join(""), "utf8") > 65536)
+      throw new Error("Codex params.appServerArgs exceeds the launch bound");
+    return [...args];
+  }
+
   private resolveGoalsEnabled(): Promise<boolean> {
     if (!this.goalsEnabledPromise) {
       this.goalsEnabledPromise = (async () => {
@@ -7493,7 +7520,7 @@ export class CodexAppServerAgentClient implements AgentClient {
     options?: { goalsEnabled?: boolean; agentId?: string },
   ): Promise<ChildProcessWithoutNullStreams> {
     const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings);
-    const args = [...launchPrefix.args, "app-server"];
+    const args = [...launchPrefix.args, "app-server", ...this.appServerArgs()];
     if (options?.goalsEnabled) {
       args.push("--enable", "goals");
     }
