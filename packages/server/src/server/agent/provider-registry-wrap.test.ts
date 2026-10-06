@@ -18,6 +18,7 @@ type OptionalAgentSessionMethodName = {
 }[keyof AgentSession];
 
 const OPTIONAL_AGENT_SESSION_METHOD_NAMES = [
+  "refreshRuntimeInfo",
   "listCommands",
   "setModel",
   "setThinkingOption",
@@ -83,6 +84,11 @@ class FakeSession implements AgentSession {
 
   async getRuntimeInfo() {
     this.recordedCalls.push("getRuntimeInfo");
+    return RUNTIME_INFO;
+  }
+
+  async refreshRuntimeInfo() {
+    this.recordedCalls.push("refreshRuntimeInfo");
     return RUNTIME_INFO;
   }
 
@@ -172,6 +178,10 @@ describe("wrapSessionProvider", () => {
     const session = new FakeSession();
     const wrapped = wrapSessionProvider("custom-claude", session);
 
+    expect(await wrapped.refreshRuntimeInfo?.()).toEqual({
+      ...RUNTIME_INFO,
+      provider: "custom-claude",
+    });
     await wrapped.listCommands?.();
     await wrapped.setModel?.("sonnet");
     await wrapped.setThinkingOption?.("high");
@@ -183,6 +193,7 @@ describe("wrapSessionProvider", () => {
     await handler?.run({ emit: () => {} });
 
     expect(session.recordedCalls).toEqual([
+      "refreshRuntimeInfo",
       "listCommands",
       "setModel",
       "setThinkingOption",

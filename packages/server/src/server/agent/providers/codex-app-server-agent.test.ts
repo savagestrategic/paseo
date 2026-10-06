@@ -1,7 +1,18 @@
+import { createHash } from "node:crypto";
 import { describe, expect, test, vi } from "vitest";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { type Dirent, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  type Dirent,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+  realpathSync,
+  statSync,
+  renameSync,
+} from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -653,6 +664,8 @@ function resultFor(method) {
   if (method === "skills/list") return { data: [] };
   if (method === "model/list") return { data: [{ id: "profile-model", isDefault: true }] };
   if (method === "thread/start") return { thread: { id: "thread-1" } };
+  if (method === "thread/loaded/list") return { data: ["thread-1"] };
+  if (method === "turn/start") return { turn: { id: "home-native-turn" } };
   return {};
 }
 
@@ -978,6 +991,55 @@ describe("Codex app-server provider", () => {
       );
     },
   );
+
+  test("runtime home evidence comes from the spawned provider home and excludes raw paths", async () => {
+    await withCustomCodexProviderHome(async ({ session, readCaptured }) => {
+      await session.startTurn("owned home evidence");
+      const homePath = readCaptured()[0]?.CODEX_HOME;
+      expect(typeof homePath).toBe("string");
+      if (typeof homePath !== "string") throw new Error("Missing captured process home");
+      const canonicalPath = realpathSync(homePath),
+        stat = statSync(canonicalPath);
+      const fingerprint = createHash("sha256")
+        .update(
+          JSON.stringify({
+            canonical_path: canonicalPath,
+            device: String(stat.dev),
+            inode: String(stat.ino),
+          }),
+        )
+        .digest("hex");
+      const info = await session.getRuntimeInfo();
+      expect(info.extra?.runtimeHomeObservation).toMatchObject({
+        source: "native-session-app-server-launch",
+        codexHomeFingerprint: fingerprint,
+        sessionId: "thread-1",
+        nativeTurnId: "home-native-turn",
+      });
+      expect(JSON.stringify(info.extra?.runtimeHomeObservation)).not.toContain(homePath);
+      const evidence = info.extra?.runtimeHomeObservation as Record<string, unknown>;
+      evidence.codexHomeFingerprint = "caller mutation";
+      expect((await session.getRuntimeInfo()).extra?.runtimeHomeObservation).toMatchObject({
+        codexHomeFingerprint: fingerprint,
+      });
+    });
+  });
+
+  test("runtime home evidence disappears when the launch directory instance is replaced", async () => {
+    await withCustomCodexProviderHome(async ({ session, readCaptured }) => {
+      await session.startTurn("owned home evidence");
+      expect((await session.getRuntimeInfo()).extra?.runtimeHomeObservation).toBeDefined();
+      const homePath = readCaptured()[0]?.CODEX_HOME;
+      if (typeof homePath !== "string") throw new Error("Missing captured process home");
+      renameSync(homePath, `${homePath}-retained`);
+      mkdirSync(homePath);
+      const refreshed = await session.refreshRuntimeInfo!();
+      expect(refreshed.extra?.runtimeHomeObservation).toBeUndefined();
+      expect(refreshed.extra?.acceptedTurnRequest).toMatchObject({
+        nativeTurnId: "home-native-turn",
+      });
+    });
+  });
 
   test("runtime info binds acknowledged turn settings without following later configuration", async () => {
     const session = createSession({ model: "gpt-6-luna", thinkingOptionId: "medium" });

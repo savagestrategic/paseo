@@ -252,6 +252,28 @@ interface CodexAppServerClientLike {
   dispose(): Promise<void>;
 }
 
+interface CodexAppServerHomeReceipt {
+  homePath: string;
+  fingerprint: string;
+}
+
+async function readCodexHomeFingerprint(homePath: string): Promise<string> {
+  if (!path.isAbsolute(homePath)) throw new Error("Codex home is not absolute");
+  const canonicalPath = await fs.realpath(homePath);
+  const stat = await fs.stat(canonicalPath);
+  if (!stat.isDirectory()) throw new Error("Codex home is not a directory");
+  // Match the canonical continuity codexHomeIdentity digest format.
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        canonical_path: canonicalPath,
+        device: String(stat.dev),
+        inode: String(stat.ino),
+      }),
+    )
+    .digest("hex");
+}
+
 interface CodexAppServerAgentDeps {
   workspaceGitService?: Pick<WorkspaceGitService, "resolveRepoRoot">;
   customProvider?: {
@@ -262,6 +284,9 @@ interface CodexAppServerAgentDeps {
   customCodexConfig?: CodexCustomProviderConfig | null;
   // The CODEX_HOME the session's app-server runs with; prompts and skills are read from it.
   codexHome?: string;
+  readAppServerHomeReceipt?: (
+    child: ChildProcessWithoutNullStreams,
+  ) => CodexAppServerHomeReceipt | null;
   _createCodexClient?: (
     child: ChildProcessWithoutNullStreams,
     logger: Logger,
@@ -3388,6 +3413,9 @@ export class CodexAppServerAgentSession implements AgentSession {
   private resolvedThreadConfiguration: Record<string, unknown> | null = null;
   private runtimeAccountObservation: Record<string, unknown> | null = null;
   private runtimeAccountClient: CodexAppServerClientLike | null = null;
+  private runtimeHomeReceipt: CodexAppServerHomeReceipt | null = null;
+  private runtimeHomeObservation: Record<string, unknown> | null = null;
+  private runtimeHomeClient: CodexAppServerClientLike | null = null;
   private serviceTier: "fast" | null = null;
   private planModeEnabled = false;
   private historyPending = false;
@@ -3544,6 +3572,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       throw this.createClosedError();
     }
     this.client = client;
+    this.runtimeHomeReceipt = this.deps.readAppServerHomeReceipt?.(child) ?? null;
     client.setUnexpectedTerminationHandler((error) => {
       this.handleUnexpectedTermination(error);
     });
@@ -3597,7 +3626,37 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
   }
 
+  private async observeRuntimeHome(): Promise<void> {
+    this.runtimeHomeObservation = null;
+    this.runtimeHomeClient = null;
+    const client = this.client,
+      threadId = this.currentThreadId;
+    const request = this.acceptedTurnRequest,
+      receipt = this.runtimeHomeReceipt;
+    if (!client || !receipt) return;
+    try {
+      const fingerprint = await readCodexHomeFingerprint(receipt.homePath);
+      if (
+        fingerprint !== receipt.fingerprint ||
+        client !== this.client ||
+        threadId !== this.currentThreadId ||
+        request !== this.acceptedTurnRequest ||
+        this.closed
+      )
+        return;
+      this.runtimeHomeClient = client;
+      this.runtimeHomeObservation = {
+        source: "native-session-app-server-launch",
+        codexHomeFingerprint: fingerprint,
+        observedAt: new Date().toISOString(),
+      };
+    } catch {
+      this.logger.debug("Native Codex home observation unavailable");
+    }
+  }
+
   private async observeRuntimeAccount(): Promise<void> {
+    await this.observeRuntimeHome();
     // Read only this session's maintained connection. Missing evidence never
     // inherits account identity from environment or another App Server process.
     this.runtimeAccountObservation = null;
@@ -4678,6 +4737,13 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.acceptedTurnRequest.sessionId === info.sessionId
     ) {
       extra.acceptedTurnRequest = { ...this.acceptedTurnRequest };
+      if (this.runtimeHomeObservation && this.runtimeHomeClient === this.client) {
+        extra.runtimeHomeObservation = {
+          ...this.runtimeHomeObservation,
+          sessionId: this.acceptedTurnRequest.sessionId,
+          nativeTurnId: this.acceptedTurnRequest.nativeTurnId,
+        };
+      }
       if (this.runtimeAccountObservation && this.runtimeAccountClient === this.client) {
         extra.runtimeAccountObservation = {
           ...this.runtimeAccountObservation,
@@ -7226,6 +7292,10 @@ export class CodexAppServerAgentSession implements AgentSession {
 export class CodexAppServerAgentClient implements AgentClient {
   readonly provider = CODEX_PROVIDER;
   readonly capabilities = CODEX_APP_SERVER_CAPABILITIES;
+  private readonly homeReceipts = new WeakMap<
+    ChildProcessWithoutNullStreams,
+    CodexAppServerHomeReceipt
+  >();
   private goalsEnabledPromise: Promise<boolean> | null = null;
   private autoReviewEnabledPromise: Promise<boolean> | null = null;
 
@@ -7238,6 +7308,7 @@ export class CodexAppServerAgentClient implements AgentClient {
   private sessionDeps(launchEnv: Record<string, string> | undefined): CodexAppServerAgentDeps {
     return {
       ...this.deps,
+      readAppServerHomeReceipt: (child) => this.homeReceipts.get(child) ?? null,
       codexHome: resolveCodexHomeDir(buildCodexAppServerEnv(this.runtimeSettings, launchEnv)),
       customCodexConfig: this.customProviderConfig(),
     };
@@ -7317,15 +7388,28 @@ export class CodexAppServerAgentClient implements AgentClient {
       },
       "provider.codex.spawn",
     );
+    const baseEnv = { ...process.env };
+    const envSpec = createProviderEnvSpec({
+      baseEnv,
+      runtimeSettings: this.runtimeSettings,
+      overlays: [launchEnv],
+    });
+    const launchEnvironment = createProviderEnv({ baseEnv, overlays: [envSpec.envOverlay] });
+    const homePath = launchEnvironment.CODEX_HOME;
+    let receipt: CodexAppServerHomeReceipt | null = null;
+    try {
+      if (typeof homePath === "string" && homePath)
+        receipt = { homePath, fingerprint: await readCodexHomeFingerprint(homePath) };
+    } catch {
+      this.logger.debug("Native Codex launch home observation unavailable");
+    }
     const child = spawnProcess(launchPrefix.command, args, {
       detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
-      ...createProviderEnvSpec({
-        runtimeSettings: this.runtimeSettings,
-        overlays: [launchEnv],
-      }),
+      ...envSpec,
     });
     assertChildWithPipes(child);
+    if (receipt) this.homeReceipts.set(child, receipt);
     return child;
   }
 
