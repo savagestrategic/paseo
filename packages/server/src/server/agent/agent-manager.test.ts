@@ -6304,6 +6304,74 @@ test("createAgent populates runtimeInfo after session creation", async () => {
   expect(snapshot.runtimeInfo?.sessionId).toBe(snapshot.persistence?.sessionId);
 });
 
+test.each(["stable", "turn_changed", "missing_support"])(
+  "read-only runtime refresh preserves lifecycle and holds %s",
+  async (scenario) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-runtime-read-"));
+    class RuntimeSession extends TestAgentSession {
+      reads = 0;
+      override async getRuntimeInfo() {
+        const info = await super.getRuntimeInfo();
+        return {
+          ...info,
+          extra: { acceptedTurnRequest: { sessionId: this.id, nativeTurnId: "native-owned" } },
+        };
+      }
+      async refreshRuntimeInfo() {
+        this.reads++;
+        const info = await this.getRuntimeInfo();
+        if (scenario === "turn_changed")
+          info.extra.acceptedTurnRequest.nativeTurnId = "replacement-turn";
+        return { ...info, extra: { ...info.extra, freshRead: true } };
+      }
+    }
+    const session =
+      scenario === "missing_support"
+        ? new TestAgentSession({ provider: "codex", cwd: workdir })
+        : new RuntimeSession({ provider: "codex", cwd: workdir });
+    const client = new (class extends TestAgentClient {
+      override async createSession(): Promise<AgentSession> {
+        return session;
+      }
+    })();
+    const manager = new AgentManager({ clients: { codex: client }, logger });
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const before = manager.getAgent(agent.id)!;
+    const refresh = () =>
+      manager.refreshAgentRuntimeInfo({
+        agentId: agent.id,
+        expectedSessionId: session.id,
+        expectedNativeTurnId: "native-owned",
+        authorize: () => true,
+      });
+    try {
+      if (scenario === "stable") {
+        const result = await refresh();
+        expect(result.extra?.freshRead).toBe(true);
+        result.extra!.freshRead = "caller mutation";
+        expect(manager.getAgent(agent.id)?.runtimeInfo?.extra?.freshRead).toBe(true);
+      } else {
+        await expect(refresh()).rejects.toThrow(
+          scenario === "missing_support"
+            ? "Provider does not support read-only runtime refresh"
+            : "Runtime refresh scope changed",
+        );
+        expect(manager.getAgent(agent.id)?.runtimeInfo).toEqual(before.runtimeInfo);
+      }
+      const after = manager.getAgent(agent.id)!;
+      expect(after.lifecycle).toBe(before.lifecycle);
+      expect(after.pendingPermissions).toBe(before.pendingPermissions);
+      expect(after.session).toBe(session);
+      expect(after.activeForegroundTurnId).toBe(before.activeForegroundTurnId);
+    } finally {
+      await manager.closeAgent(agent.id);
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
+
 test("accepted foreground turn publishes runtime evidence before completion", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-accepted-runtime-"));
   class AcceptedRuntimeSession extends TestAgentSession {

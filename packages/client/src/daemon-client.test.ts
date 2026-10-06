@@ -7112,3 +7112,72 @@ for (const result of [
     expect(await pending).toEqual(result);
   });
 }
+
+test("runtime refresh refuses an unsupported host without sending a legacy request", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "runtime-read",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connected = client.connect();
+  mock.triggerOpen();
+  await connected;
+  const sent = mock.sent.length;
+  await expect(
+    client.refreshAgentRuntimeInfo({
+      agentId: "recipient",
+      expectedSessionId: "native-session",
+      expectedNativeTurnId: "native-turn",
+    }),
+  ).rejects.toThrow("update the host");
+  expect(mock.sent.length).toBe(sent);
+});
+
+for (const error of [null, "Read-only runtime refresh unavailable or scope changed"]) {
+  test(`runtime refresh retains its correlated response ${error ?? "success"}`, async () => {
+    const mock = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "runtime-read",
+      transportFactory: () => mock.transport,
+      reconnect: { enabled: false },
+    });
+    clients.push(client);
+    const connected = client.connect();
+    mock.triggerOpen({ features: { ownedSubscriptions: true, agentRuntimeRefresh: true } });
+    await connected;
+    const input = {
+      agentId: "recipient",
+      expectedSessionId: "native-session",
+      expectedNativeTurnId: "native-turn",
+    };
+    const pending = client.refreshAgentRuntimeInfo(input);
+    const frame = parseSentFrame(mock.sent.at(-1));
+    expect(frame).toEqual({
+      ...input,
+      type: "agent.runtime.refresh.request",
+      requestId: expect.any(String),
+    });
+    const runtimeInfo = {
+      provider: "codex",
+      sessionId: "native-session",
+      extra: { observed: true },
+    };
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "agent.runtime.refresh.response",
+        payload: {
+          requestId: frame.requestId,
+          agentId: input.agentId,
+          runtimeInfo: error ? null : runtimeInfo,
+          error,
+        },
+      }),
+    );
+    if (error) await expect(pending).rejects.toThrow(error);
+    else expect(await pending).toEqual(runtimeInfo);
+  });
+}

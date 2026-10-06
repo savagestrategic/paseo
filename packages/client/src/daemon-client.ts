@@ -1,5 +1,7 @@
 import type {
   AdmitAgentMessageRequest,
+  RefreshAgentRuntimeInfoRequest,
+  RefreshAgentRuntimeInfoResponse,
   AgentMessageAdmissionResult,
 } from "@getpaseo/protocol/messages";
 import { subscribeTimeline, type TimelineMessage } from "./timeline-subscription/index.js";
@@ -3423,6 +3425,32 @@ export class DaemonClient {
   // ============================================================================
   // Agent Interaction
   // ============================================================================
+
+  async refreshAgentRuntimeInfo(
+    input: Omit<RefreshAgentRuntimeInfoRequest, "type" | "requestId">,
+  ): Promise<RefreshAgentRuntimeInfoResponse["payload"]["runtimeInfo"]> {
+    if (this.getLastServerInfoMessage()?.features?.agentRuntimeRefresh !== true) {
+      throw new Error("Host does not support read-only runtime refresh; update the host");
+    }
+    const requestId = this.createRequestId();
+    const message = SessionInboundMessageSchema.parse({
+      ...input,
+      type: "agent.runtime.refresh.request",
+      requestId,
+    });
+    const payload = await this.sendRequest({
+      requestId,
+      message,
+      options: { skipQueue: true },
+      select: (msg) =>
+        msg.type === "agent.runtime.refresh.response" && msg.payload.requestId === requestId
+          ? msg.payload
+          : null,
+    });
+    if (payload.error || !payload.runtimeInfo)
+      throw new Error(payload.error ?? "Runtime evidence unavailable");
+    return payload.runtimeInfo;
+  }
 
   async admitAgentMessage(
     input: Omit<AdmitAgentMessageRequest, "type" | "requestId">,

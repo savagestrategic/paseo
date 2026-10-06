@@ -1788,6 +1788,7 @@ export class VoiceAssistantWebSocketServer {
       features: {
         ownedSubscriptions: true,
         conditionalAgentMessages: true,
+        agentRuntimeRefresh: true,
         agentRequestReceipts: true,
         workspaceRequestReceipts: true,
         creationLifecycle: true,

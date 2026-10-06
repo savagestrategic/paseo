@@ -2711,6 +2711,8 @@ export class Session {
 
   private dispatchAgentLifecycleMessage(msg: SessionInboundMessage): Promise<void> | undefined {
     switch (msg.type) {
+      case "agent.runtime.refresh.request":
+        return this.handleRefreshAgentRuntimeInfo(msg);
       case "fetch_agents_request":
         return this.handleFetchAgents(msg);
       case "fetch_agent_history_request":
@@ -7559,6 +7561,40 @@ export class Session {
           markedAgentId,
           success: false,
           error: message,
+        },
+      });
+    }
+  }
+
+  private async handleRefreshAgentRuntimeInfo(
+    msg: Extract<SessionInboundMessage, { type: "agent.runtime.refresh.request" }>,
+  ): Promise<void> {
+    const signal = this.delivery.requestSignal;
+    try {
+      const runtimeInfo = await this.agentManager.refreshAgentRuntimeInfo({
+        agentId: msg.agentId,
+        expectedSessionId: msg.expectedSessionId,
+        expectedNativeTurnId: msg.expectedNativeTurnId,
+        authorize: () => !signal.aborted && this.authorization.allowsInbound(msg),
+      });
+      this.emit({
+        type: "agent.runtime.refresh.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: msg.agentId,
+          runtimeInfo,
+          error: null,
+        },
+      });
+    } catch {
+      // Do not expose provider errors, credentials or private configuration.
+      this.emit({
+        type: "agent.runtime.refresh.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: msg.agentId,
+          runtimeInfo: null,
+          error: "Read-only runtime refresh unavailable or scope changed",
         },
       });
     }

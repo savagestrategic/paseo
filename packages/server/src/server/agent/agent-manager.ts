@@ -123,6 +123,13 @@ function submittedPromptText(prompt: AgentPromptInput): string {
     .trim();
 }
 
+export interface RefreshAgentRuntimeInfoInput {
+  agentId: string;
+  expectedSessionId: string;
+  expectedNativeTurnId: string;
+  authorize: () => boolean;
+}
+
 export class AgentManagerShuttingDownError extends Error {
   constructor() {
     super("Agent manager is shutting down");
@@ -1164,6 +1171,43 @@ export class AgentManager {
         );
       }
     }
+  }
+
+  async refreshAgentRuntimeInfo(input: RefreshAgentRuntimeInfoInput): Promise<AgentRuntimeInfo> {
+    const { agentId, expectedSessionId, expectedNativeTurnId, authorize } = input;
+    const agent = this.requireSessionAgent(agentId);
+    const session = agent.session;
+    const foregroundTurnId = agent.activeForegroundTurnId;
+    const matches = (info: AgentRuntimeInfo | undefined): boolean => {
+      const accepted = info?.extra?.acceptedTurnRequest;
+      return (
+        info?.sessionId === expectedSessionId &&
+        typeof accepted === "object" &&
+        accepted !== null &&
+        "nativeTurnId" in accepted &&
+        accepted.nativeTurnId === expectedNativeTurnId &&
+        "sessionId" in accepted &&
+        accepted.sessionId === expectedSessionId
+      );
+    };
+    if (!session.refreshRuntimeInfo)
+      throw new Error("Provider does not support read-only runtime refresh");
+    if (!authorize() || !matches(agent.runtimeInfo))
+      throw new Error("Runtime refresh scope changed");
+    const info = await session.refreshRuntimeInfo();
+    if (
+      !authorize() ||
+      this.agents.get(agent.id) !== agent ||
+      agent.session !== session ||
+      agent.activeForegroundTurnId !== foregroundTurnId ||
+      !matches(info) ||
+      !matches(agent.runtimeInfo)
+    ) {
+      throw new Error("Runtime refresh scope changed");
+    }
+    // Updating evidence does not reload, resume, clear permissions or touch lifecycle state.
+    agent.runtimeInfo = structuredClone(info);
+    return structuredClone(info);
   }
 
   getAgent(id: string): ManagedAgent | null {

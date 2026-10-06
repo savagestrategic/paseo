@@ -69,6 +69,13 @@ model; it does not override the model list returned by a resolver.
 
 Implement the `AgentClient` and `AgentSession` interfaces from `agent-sdk-types.ts` yourself. This gives full control but requires you to handle process management, streaming, permissions, and session persistence from scratch.
 
+Providers may implement optional `AgentSession.refreshRuntimeInfo()` for fresh evidence on an
+already connected, acknowledged native session. It must not connect, create a thread, start a turn,
+resume, or clear permissions. The manager's `refreshAgentRuntimeInfo` binds the exact native session
+and accepted turn before and after the read. SDK callers use `agent.runtime.refresh.request` only
+when `server_info.features.agentRuntimeRefresh` is advertised; unsupported hosts have no fallback
+to the interrupting legacy agent refresh operation. Fresh evidence does not grant execution authority.
+
 Existing direct providers: `claude` (in `providers/claude/agent.ts`), `codex` (`codex-app-server-agent.ts`), `opencode` (`opencode/runtime-client.ts`), `pi` (`providers/pi/agent.ts`), and `omp` (`providers/omp/agent.ts`). The dev-only `mock` provider (`mock-load-test-agent.ts`) is also direct.
 
 Claude first-party model metadata lives in `packages/server/src/server/agent/providers/claude/model-manifest.ts`. When adding or updating a Claude model, update that manifest only; the model picker thinking options and Claude-specific feature gates are derived from the manifest. Do not add model-specific Claude capability lists in feature code.

@@ -1399,6 +1399,14 @@ export const AdmitAgentMessageRequestSchema = z.object({
   expiresAt: z.string(),
 });
 
+export const RefreshAgentRuntimeInfoRequestSchema = z.object({
+  type: z.literal("agent.runtime.refresh.request"),
+  requestId: z.string(),
+  agentId: z.string().min(1),
+  expectedSessionId: z.string().min(1),
+  expectedNativeTurnId: z.string().min(1),
+});
+
 export const WaitForFinishRequestSchema = z.object({
   type: z.literal("wait_for_finish_request"),
   requestId: z.string(),
@@ -3227,6 +3235,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   SetVoiceModeMessageSchema,
   SendAgentMessageRequestSchema,
   AdmitAgentMessageRequestSchema,
+  RefreshAgentRuntimeInfoRequestSchema,
   WaitForFinishRequestSchema,
   DaemonGetStatusRequestSchema,
   DaemonGetPairingOfferRequestSchema,
@@ -3716,6 +3725,9 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(conditionalAgentMessages): added after v0.10.3; remove the gate
         // after 2027-04-05 only when the supported daemon floor includes it.
         conditionalAgentMessages: z.boolean().optional(),
+        // COMPAT(agentRuntimeRefresh): added after v0.10.3; remove the gate
+        // after 2027-04-05 only when the supported daemon floor includes it.
+        agentRuntimeRefresh: z.boolean().optional(),
         // COMPAT(canonicalSubmittedPrompts): added in v0.2.6, remove gate after 2027-01-30.
         canonicalSubmittedPrompts: z.boolean().optional(),
         // COMPAT(agentTurnIdentity): accept peers that observed pre-release v0.2.6 through 2027-01-31.
@@ -4964,6 +4976,16 @@ export const AdmitAgentMessageResponseSchema = z.object({
     agentId: z.string(),
     messageId: z.string(),
     result: AgentMessageAdmissionResultSchema,
+  }),
+});
+
+export const RefreshAgentRuntimeInfoResponseSchema = z.object({
+  type: z.literal("agent.runtime.refresh.response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    runtimeInfo: AgentRuntimeInfoSchema.nullable(),
+    error: z.string().nullable(),
   }),
 });
 
@@ -6878,6 +6900,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceMarkUnreadResponseSchema,
   SendAgentMessageResponseMessageSchema,
   AdmitAgentMessageResponseSchema,
+  RefreshAgentRuntimeInfoResponseSchema,
   SetVoiceModeResponseMessageSchema,
   DaemonGetStatusResponseSchema,
   DaemonGetPairingOfferResponseSchema,
@@ -7192,6 +7215,9 @@ export type ProjectListRequestMessage = z.infer<typeof ProjectListRequestMessage
 export type FetchAgentRequestMessage = z.infer<typeof FetchAgentRequestMessageSchema>;
 export type AgentForkContextRequestMessage = z.infer<typeof AgentForkContextRequestMessageSchema>;
 export type SendAgentMessageRequest = z.infer<typeof SendAgentMessageRequestSchema>;
+export type RefreshAgentRuntimeInfoRequest = z.infer<typeof RefreshAgentRuntimeInfoRequestSchema>;
+export type RefreshAgentRuntimeInfoResponse = z.infer<typeof RefreshAgentRuntimeInfoResponseSchema>;
+
 export type AdmitAgentMessageRequest = z.infer<typeof AdmitAgentMessageRequestSchema>;
 export type AgentMessageAdmissionResult = z.infer<typeof AgentMessageAdmissionResultSchema>;
 export type WaitForFinishRequest = z.infer<typeof WaitForFinishRequestSchema>;
