@@ -1048,6 +1048,8 @@ describe("Codex app-server provider", () => {
           .update(realpathSync(launchExecutable))
           .digest("hex"),
         homeConfigFileSha256: null,
+        homeConfigFileIdentityHash: null,
+        executableFileIdentityHash: expect.stringMatching(/^[a-f0-9]{64}$/),
       });
       expect(info.extra?.runtimeLaunchObservation).toHaveProperty(
         "argvSha256",
@@ -1095,6 +1097,10 @@ describe("Codex app-server provider", () => {
             createHash("sha256").update(config).digest("hex"),
           );
           const homePath = readCaptured()[0]?.CODEX_HOME;
+          expect(info.extra?.runtimeLaunchObservation).toHaveProperty(
+            "homeConfigFileIdentityHash",
+            expect.stringMatching(/^[a-f0-9]{64}$/),
+          );
           if (typeof homePath !== "string") throw new Error("Missing process home");
           writeFileSync(path.join(homePath, "config.toml"), "# source changed\n" + config);
           const refreshed = await session.refreshRuntimeInfo!();

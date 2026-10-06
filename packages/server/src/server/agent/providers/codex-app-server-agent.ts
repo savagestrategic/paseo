@@ -3747,8 +3747,14 @@ export class CodexAppServerAgentSession implements AgentSession {
             .update(receipt.launch.executable.canonicalPath)
             .digest("hex"),
           executableSha256: receipt.launch.executable.sha256,
+          executableFileIdentityHash: createHash("sha256")
+            .update(receipt.launch.executable.identity)
+            .digest("hex"),
           argvSha256: receipt.launch.argvSha256,
           homeConfigFileSha256: receipt.launch.homeConfig?.sha256 ?? null,
+          homeConfigFileIdentityHash: receipt.launch.homeConfig
+            ? createHash("sha256").update(receipt.launch.homeConfig.identity).digest("hex")
+            : null,
           homeConfigFilePathHash: receipt.launch.homeConfig
             ? createHash("sha256").update(receipt.launch.homeConfig.canonicalPath).digest("hex")
             : null,
